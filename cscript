@@ -1,6 +1,6 @@
 
 def build(dep_prefix, install_prefix, target, static, parallel):
-    configure = './configure --prefix=%s' % install_prefix)
+    configure = './configure --prefix=%s' % install_prefix
     if static:
        configure += ' --enable-static'
     command(cmd)
