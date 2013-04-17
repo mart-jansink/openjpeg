@@ -13,4 +13,6 @@ def command(c):
     os.system(c)
 
 if args.command == 'build':
-    command('./waf configure --prefix=%s' % args.prefix)
+    command('./configure --prefix=%s' % args.prefix)
+    command('make -j2')
+    command('make install')
