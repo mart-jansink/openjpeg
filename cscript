@@ -1,0 +1,5 @@
+
+def build(prefix):
+    command('./configure --prefix=%s' % prefix)
+    command('make -j2')
+    command('make install')
