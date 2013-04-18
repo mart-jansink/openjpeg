@@ -1,6 +1,6 @@
 
 def build(env, target):
-    cmd = './configure --prefix=%s --disable-lcms1 --disable-lcms2 --disable-tiff' % env.work_dir(True)
+    cmd = './configure --prefix=%s --disable-lcms1 --disable-lcms2 --disable-tiff' % env.work_dir_chroot()
     if target.platform == 'windows':
         cmd += ' --host=%s' % target.host
 
