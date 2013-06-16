@@ -3,6 +3,8 @@ def build(env, target):
     cmd = './configure --prefix=%s --disable-lcms1 --disable-lcms2 --disable-tiff' % env.work_dir_cscript()
     if target.platform == 'windows':
         cmd += ' --host=%s' % target.host
+    elif target.platform == 'osx':
+        cmd += ' --disable-dependency-tracking'
 
     env.command(cmd)
     env.command('make -j2 V=1')
