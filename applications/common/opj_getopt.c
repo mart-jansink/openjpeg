@@ -80,7 +80,7 @@ int opj_getopt(int nargc, char *const *nargv, const char *ostr) {
     }
   }				/* option letter okay? */
   if ((opj_optopt = (int) *place++) == (int) ':' ||
-      !(oli = strchr(ostr, opj_optopt))) {
+      !(oli = strchr((char *) ostr, opj_optopt))) {
     /*
      * if the user didn't specify '-' as an option,
      * assume it means -1.
@@ -207,7 +207,7 @@ again:
 				lastidx=opj_optind; lastofs=0;
 			}
 			opj_optopt=argv[opj_optind][lastofs+1];
-			if ((tmp=strchr(optstring,opj_optopt))) {/*Found input parameter in list*/
+			if ((tmp=strchr((char *) optstring,opj_optopt))) {/*Found input parameter in list*/
 				if (*tmp==0) {	/* apparently, we looked for \0, i.e. end of argument */
 					++opj_optind;
 					goto again;
