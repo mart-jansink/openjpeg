@@ -1,6 +1,6 @@
 
 def build(target, options):
-    cmd = './configure --prefix=%s --disable-lcms1 --disable-lcms2 --disable-tiff' % target.work_dir_cscript()
+    cmd = './configure --prefix=%s --disable-lcms1 --disable-lcms2 --disable-tiff' % target.directory
     if target.platform == 'osx':
         cmd += ' --disable-dependency-tracking'
     if target.platform == 'windows':
