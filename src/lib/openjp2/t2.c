@@ -797,8 +797,7 @@ static OPJ_BOOL opj_t2_encode_packet(OPJ_UINT32 tileno,
 
     /* Writing Packet header */
     band = res->bands;
-    for (bandno = 0; !packet_empty &&
-            bandno < res->numbands; ++bandno, ++band)      {
+    for (bandno = 0; bandno < res->numbands; ++bandno, ++band)      {
         opj_tcd_precinct_t *prc;
 
         /* Skip empty bands */
@@ -931,7 +930,7 @@ static OPJ_BOOL opj_t2_encode_packet(OPJ_UINT32 tileno,
 
     /* Writing the packet body */
     band = res->bands;
-    for (bandno = 0; !packet_empty && bandno < res->numbands; bandno++, ++band) {
+    for (bandno = 0; bandno < res->numbands; bandno++, ++band) {
         opj_tcd_precinct_t *prc;
 
         /* Skip empty bands */
