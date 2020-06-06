@@ -225,8 +225,6 @@ static INLINE OPJ_INT32 opj_int_fix_mul(OPJ_INT32 a, OPJ_INT32 b)
     OPJ_INT64 temp = (OPJ_INT64) a * (OPJ_INT64) b ;
 #endif
     temp += 4096;
-    assert((temp >> 13) <= (OPJ_INT64)0x7FFFFFFF);
-    assert((temp >> 13) >= (-(OPJ_INT64)0x7FFFFFFF - (OPJ_INT64)1));
     return (OPJ_INT32)(temp >> 13);
 }
 
@@ -238,9 +236,6 @@ static INLINE OPJ_INT32 opj_int_fix_mul_t1(OPJ_INT32 a, OPJ_INT32 b)
     OPJ_INT64 temp = (OPJ_INT64) a * (OPJ_INT64) b ;
 #endif
     temp += 4096;
-    assert((temp >> (13 + 11 - T1_NMSEDEC_FRACBITS)) <= (OPJ_INT64)0x7FFFFFFF);
-    assert((temp >> (13 + 11 - T1_NMSEDEC_FRACBITS)) >= (-(OPJ_INT64)0x7FFFFFFF -
-            (OPJ_INT64)1));
     return (OPJ_INT32)(temp >> (13 + 11 - T1_NMSEDEC_FRACBITS)) ;
 }
 
