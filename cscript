@@ -18,7 +18,7 @@ def build(target, options):
         cmd += ' -DCMAKE_TOOLCHAIN_FILE=mingw.cmake'
         f.close()
     if target.platform == 'linux':
-        cmd += ' -DBUILD_SHARED_LIBS=OFF -DCMAKE_C_FLAGS_RELEASE="-O3 -NDEBUG -mavx2"'
+        cmd += ' -DBUILD_SHARED_LIBS=OFF -DCMAKE_C_FLAGS_RELEASE="-O3 -DNDEBUG -mavx2"'
     if target.platform == 'osx':
         cmd += ' -DCMAKE_OSX_SYSROOT=%s/MacOSX%s.sdk' % (target.sdk_prefix, target.sdk)
 
