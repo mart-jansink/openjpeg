@@ -6941,11 +6941,13 @@ static void opj_j2k_set_cinema_parameters(opj_cparameters_t *parameters,
                       "Maximum 1302083 compressed bytes @ 24fps\n"
                       "As no rate has been given, this limit will be used.\n");
     } else if (parameters->max_cs_size > OPJ_CINEMA_24_CS) {
+        /*
         opj_event_msg(p_manager, EVT_WARNING,
                       "JPEG 2000 Profile-3 and 4 (2k/4k dc profile) requires:\n"
                       "Maximum 1302083 compressed bytes @ 24fps\n"
                       "-> Specified rate exceeds this limit. Rate will be forced to 1302083 bytes.\n");
         parameters->max_cs_size = OPJ_CINEMA_24_CS;
+        */
     }
 
     if (parameters->max_comp_size <= 0) {
@@ -6956,11 +6958,13 @@ static void opj_j2k_set_cinema_parameters(opj_cparameters_t *parameters,
                       "Maximum 1041666 compressed bytes @ 24fps\n"
                       "As no rate has been given, this limit will be used.\n");
     } else if (parameters->max_comp_size > OPJ_CINEMA_24_COMP) {
+        /*
         opj_event_msg(p_manager, EVT_WARNING,
                       "JPEG 2000 Profile-3 and 4 (2k/4k dc profile) requires:\n"
                       "Maximum 1041666 compressed bytes @ 24fps\n"
                       "-> Specified rate exceeds this limit. Rate will be forced to 1041666 bytes.\n");
         parameters->max_comp_size = OPJ_CINEMA_24_COMP;
+        */
     }
 
     parameters->tcp_rates[0] = (OPJ_FLOAT32)(image->numcomps * image->comps[0].w *
