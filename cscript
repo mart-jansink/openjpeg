@@ -25,7 +25,6 @@ def build(target, options):
         f.close()
     if target.platform == 'linux':
         cmd += ' -DBUILD_SHARED_LIBS=OFF'
-        cmd += ' -DCMAKE_C_FLAGS="-O3 -msse4.1 -mavx2 -DNDEBUG"'
     if target.platform == 'osx':
         cmd += ' -DCMAKE_OSX_SYSROOT=%s/MacOSX%s.sdk' % (target.sdk_prefix, target.sdk)
 
