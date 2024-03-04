@@ -21,7 +21,6 @@ def build(target, options):
         print("SET(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)", file=f)
         print("SET(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)", file=f)
         cmd += ' -DCMAKE_TOOLCHAIN_FILE=mingw.cmake'
-        cmd += ' -DCMAKE_C_FLAGS="-O3 -msse4.1 -mavx2 -DNDEBUG"'
         f.close()
     if target.platform == 'linux':
         cmd += ' -DBUILD_SHARED_LIBS=OFF'
