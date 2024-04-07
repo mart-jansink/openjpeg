@@ -278,6 +278,7 @@ typedef struct opj_cparameters {
 	int prcw_init[J2K_MAXRLVLS];
 	/** initial precinct height */
 	int prch_init[J2K_MAXRLVLS];
+	int numgbits;
 
 	/**@name command line encoder parameters (not used inside the library) */
 	/*@{*/

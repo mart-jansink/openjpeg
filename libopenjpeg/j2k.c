@@ -2205,7 +2205,7 @@ void j2k_setup_encoder(opj_j2k_t *j2k, opj_cparameters_t *parameters, opj_image_
 			tccp->cblksty = parameters->mode;
 			tccp->qmfbid = parameters->irreversible ? 0 : 1;
 			tccp->qntsty = parameters->irreversible ? J2K_CCP_QNTSTY_SEQNT : J2K_CCP_QNTSTY_NOQNT;
-			tccp->numgbits = 2;
+			tccp->numgbits = parameters->numgbits;
 			if (i == parameters->roi_compno) {
 				tccp->roishift = parameters->roi_shift;
 			} else {
