@@ -411,12 +411,13 @@ OPJ_BOOL opj_jp2_write_tile(opj_jp2_t *p_jp2,
  *
  * @return FIXME DOC
  */
-OPJ_BOOL opj_jp2_decode_tile(opj_jp2_t * p_jp2,
-                             OPJ_UINT32 p_tile_index,
-                             OPJ_BYTE * p_data,
-                             OPJ_UINT32 p_data_size,
-                             opj_stream_private_t *p_stream,
-                             opj_event_mgr_t * p_manager);
+OPJ_RESULT opj_jp2_decode_tile(opj_jp2_t * p_jp2,
+                               OPJ_UINT32 p_tile_index,
+                               OPJ_BYTE * p_data,
+                               OPJ_UINT32 p_data_size,
+                               opj_stream_private_t *p_stream,
+                               opj_event_mgr_t * p_manager,
+			       opj_cancel_t * p_cancel);
 
 /**
  * Creates a jpeg2000 file decompressor.

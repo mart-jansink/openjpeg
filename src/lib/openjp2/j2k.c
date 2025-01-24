@@ -360,9 +360,10 @@ static void opj_j2k_copy_tile_quantization_parameters(opj_j2k_t *p_j2k);
 /**
  * Reads the tiles.
  */
-static OPJ_BOOL opj_j2k_decode_tiles(opj_j2k_t *p_j2k,
-                                     opj_stream_private_t *p_stream,
-                                     opj_event_mgr_t * p_manager);
+static OPJ_RESULT opj_j2k_decode_tiles(opj_j2k_t *p_j2k,
+                                       opj_stream_private_t *p_stream,
+                                       opj_event_mgr_t * p_manager,
+                                       opj_cancel_t * p_cancel);
 
 static OPJ_BOOL opj_j2k_pre_write_tile(opj_j2k_t * p_j2k,
                                        OPJ_UINT32 p_tile_index,
@@ -9856,12 +9857,13 @@ OPJ_BOOL opj_j2k_read_tile_header(opj_j2k_t * p_j2k,
     return OPJ_TRUE;
 }
 
-OPJ_BOOL opj_j2k_decode_tile(opj_j2k_t * p_j2k,
-                             OPJ_UINT32 p_tile_index,
-                             OPJ_BYTE * p_data,
-                             OPJ_UINT32 p_data_size,
-                             opj_stream_private_t *p_stream,
-                             opj_event_mgr_t * p_manager)
+OPJ_RESULT opj_j2k_decode_tile(opj_j2k_t * p_j2k,
+                               OPJ_UINT32 p_tile_index,
+                               OPJ_BYTE * p_data,
+                               OPJ_UINT32 p_data_size,
+                               opj_stream_private_t *p_stream,
+                               opj_event_mgr_t * p_manager,
+                               opj_cancel_t * p_cancel)
 {
     OPJ_UINT32 l_current_marker;
     OPJ_BYTE l_data [2];
@@ -9875,13 +9877,13 @@ OPJ_BOOL opj_j2k_decode_tile(opj_j2k_t * p_j2k,
 
     if (!(p_j2k->m_specific_param.m_decoder.m_state & J2K_STATE_DATA)
             || (p_tile_index != p_j2k->m_current_tile_number)) {
-        return OPJ_FALSE;
+        return OPJ_FAILURE;
     }
 
     l_tcp = &(p_j2k->m_cp.tcps[p_tile_index]);
     if (! l_tcp->m_data) {
         opj_j2k_tcp_destroy(l_tcp);
-        return OPJ_FALSE;
+        return OPJ_FAILURE;
     }
 
     /* When using the opj_read_tile_header / opj_decode_tile_data API */
@@ -9901,11 +9903,11 @@ OPJ_BOOL opj_j2k_decode_tile(opj_j2k_t * p_j2k,
                               l_tcp->m_data,
                               l_tcp->m_data_size,
                               p_tile_index,
-                              p_j2k->cstr_index, p_manager)) {
+                              p_j2k->cstr_index, p_manager, p_cancel)) {
         opj_j2k_tcp_destroy(l_tcp);
         p_j2k->m_specific_param.m_decoder.m_state |= J2K_STATE_ERR;
         opj_event_msg(p_manager, EVT_ERROR, "Failed to decode.\n");
-        return OPJ_FALSE;
+        return OPJ_FAILURE;
     }
 
     /* p_data can be set to NULL when the call will take care of using */
@@ -9913,7 +9915,7 @@ OPJ_BOOL opj_j2k_decode_tile(opj_j2k_t * p_j2k,
     /* tile decoding optimization. */
     if (p_data != NULL) {
         if (! opj_tcd_update_tile_data(p_j2k->m_tcd, p_data, p_data_size)) {
-            return OPJ_FALSE;
+            return OPJ_FAILURE;
         }
 
         /* To avoid to destroy the tcp which can be useful when we try to decode a tile decoded before (cf j2k_random_tile_access)
@@ -9928,7 +9930,7 @@ OPJ_BOOL opj_j2k_decode_tile(opj_j2k_t * p_j2k,
 
     if (opj_stream_get_number_byte_left(p_stream) == 0
             && p_j2k->m_specific_param.m_decoder.m_state == J2K_STATE_NEOC) {
-        return OPJ_TRUE;
+        return OPJ_SUCCESS;
     }
 
     if (p_j2k->m_specific_param.m_decoder.m_state != J2K_STATE_EOC) {
@@ -9946,14 +9948,14 @@ OPJ_BOOL opj_j2k_decode_tile(opj_j2k_t * p_j2k,
             if (opj_stream_get_number_byte_left(p_stream) == 0) {
                 p_j2k->m_specific_param.m_decoder.m_state = J2K_STATE_NEOC;
                 opj_event_msg(p_manager, EVT_WARNING, "Stream does not end with EOC\n");
-                return OPJ_TRUE;
+                return OPJ_SUCCESS;
             }
             opj_event_msg(p_manager, EVT_ERROR, "Stream too short, expected SOT\n");
-            return OPJ_FALSE;
+            return OPJ_FAILURE;
         }
     }
 
-    return OPJ_TRUE;
+    return OPJ_SUCCESS;
 }
 
 static OPJ_BOOL opj_j2k_update_image_data(opj_tcd_t * p_tcd,
@@ -11671,9 +11673,10 @@ static OPJ_BOOL opj_j2k_are_all_used_components_decoded(opj_j2k_t *p_j2k,
 }
 
 
-static OPJ_BOOL opj_j2k_decode_tiles(opj_j2k_t *p_j2k,
-                                     opj_stream_private_t *p_stream,
-                                     opj_event_mgr_t * p_manager)
+static OPJ_RESULT opj_j2k_decode_tiles(opj_j2k_t *p_j2k,
+                                       opj_stream_private_t *p_stream,
+                                       opj_event_mgr_t * p_manager,
+                                       opj_cancel_t * p_cancel)
 {
     OPJ_BOOL l_go_on = OPJ_TRUE;
     OPJ_UINT32 l_current_tile_no;
@@ -11690,6 +11693,7 @@ static OPJ_BOOL opj_j2k_decode_tiles(opj_j2k_t *p_j2k,
             p_j2k->m_output_image->x1 == p_j2k->m_cp.tdx &&
             p_j2k->m_output_image->y1 == p_j2k->m_cp.tdy) {
         OPJ_UINT32 i;
+        OPJ_RESULT r;
         if (! opj_j2k_read_tile_header(p_j2k,
                                        &l_current_tile_no,
                                        NULL,
@@ -11702,10 +11706,12 @@ static OPJ_BOOL opj_j2k_decode_tiles(opj_j2k_t *p_j2k,
             return OPJ_FALSE;
         }
 
-        if (! opj_j2k_decode_tile(p_j2k, l_current_tile_no, NULL, 0,
-                                  p_stream, p_manager)) {
-            opj_event_msg(p_manager, EVT_ERROR, "Failed to decode tile 1/1\n");
-            return OPJ_FALSE;
+        r = opj_j2k_decode_tile(p_j2k, l_current_tile_no, NULL, 0, p_stream, p_manager, p_cancel);
+        if (r != OPJ_SUCCESS) {
+            if (r == OPJ_FAILURE) {
+                    opj_event_msg(p_manager, EVT_ERROR, "Failed to decode tile 1/1\n");
+            }
+            return r;
         }
 
         /* Transfer TCD data to output image data */
@@ -11722,6 +11728,8 @@ static OPJ_BOOL opj_j2k_decode_tiles(opj_j2k_t *p_j2k,
     }
 
     for (;;) {
+        OPJ_RESULT r;
+
         if (p_j2k->m_cp.tw == 1 && p_j2k->m_cp.th == 1 &&
                 p_j2k->m_cp.tcps[0].m_data != NULL) {
             l_current_tile_no = 0;
@@ -11745,11 +11753,13 @@ static OPJ_BOOL opj_j2k_decode_tiles(opj_j2k_t *p_j2k,
             }
         }
 
-        if (! opj_j2k_decode_tile(p_j2k, l_current_tile_no, NULL, 0,
-                                  p_stream, p_manager)) {
-            opj_event_msg(p_manager, EVT_ERROR, "Failed to decode tile %d/%d\n",
-                          l_current_tile_no + 1, p_j2k->m_cp.th * p_j2k->m_cp.tw);
-            return OPJ_FALSE;
+        r = opj_j2k_decode_tile(p_j2k, l_current_tile_no, NULL, 0, p_stream, p_manager, p_cancel);
+        if (r != OPJ_SUCCESS) {
+                if (r == OPJ_FAILURE) {
+                        opj_event_msg(p_manager, EVT_ERROR, "Failed to decode tile %d/%d\n",
+                                      l_current_tile_no + 1, p_j2k->m_cp.th * p_j2k->m_cp.tw);
+                }
+                return OPJ_FALSE;
         }
 
         opj_event_msg(p_manager, EVT_INFO, "Tile %d/%d has been decoded.\n",
@@ -11811,9 +11821,10 @@ static OPJ_BOOL opj_j2k_setup_decoding(opj_j2k_t *p_j2k,
 /*
  * Read and decode one tile.
  */
-static OPJ_BOOL opj_j2k_decode_one_tile(opj_j2k_t *p_j2k,
-                                        opj_stream_private_t *p_stream,
-                                        opj_event_mgr_t * p_manager)
+static OPJ_RESULT opj_j2k_decode_one_tile(opj_j2k_t *p_j2k,
+                                          opj_stream_private_t *p_stream,
+                                          opj_event_mgr_t * p_manager,
+                                          opj_cancel_t * p_cancel)
 {
     OPJ_BOOL l_go_on = OPJ_TRUE;
     OPJ_UINT32 l_current_tile_no;
@@ -11866,6 +11877,8 @@ static OPJ_BOOL opj_j2k_decode_one_tile(opj_j2k_t *p_j2k,
     }
 
     for (;;) {
+        OPJ_RESULT r;
+
         if (! opj_j2k_read_tile_header(p_j2k,
                                        &l_current_tile_no,
                                        NULL,
@@ -11882,9 +11895,9 @@ static OPJ_BOOL opj_j2k_decode_one_tile(opj_j2k_t *p_j2k,
             break;
         }
 
-        if (! opj_j2k_decode_tile(p_j2k, l_current_tile_no, NULL, 0,
-                                  p_stream, p_manager)) {
-            return OPJ_FALSE;
+        r = opj_j2k_decode_tile(p_j2k, l_current_tile_no, NULL, 0, p_stream, p_manager, p_cancel);
+        if (r != OPJ_SUCCESS) {
+            return r;
         }
         opj_event_msg(p_manager, EVT_INFO, "Tile %d/%d has been decoded.\n",
                       l_current_tile_no + 1, p_j2k->m_cp.th * p_j2k->m_cp.tw);

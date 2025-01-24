@@ -36,6 +36,7 @@
 #endif /* _WIN32 */
 
 #include "opj_includes.h"
+#include <stdatomic.h>
 
 
 /* ---------------------------------------------------------------------- */
@@ -83,6 +84,17 @@ OPJ_BOOL OPJ_CALLCONV opj_set_error_handler(opj_codec_t * p_codec,
     l_codec->m_event_mgr.error_handler = p_callback;
     l_codec->m_event_mgr.m_error_data = p_user_data;
 
+    return OPJ_TRUE;
+}
+
+OPJ_BOOL OPJ_CALLCONV opj_set_cancel(opj_codec_t * p_codec, opj_cancel_t * p_cancel)
+{
+    opj_codec_private_t * l_codec = (opj_codec_private_t *) p_codec;
+    if (! l_codec) {
+        return OPJ_FALSE;
+    }
+
+    l_codec->p_cancel = p_cancel;
     return OPJ_TRUE;
 }
 
@@ -245,7 +257,8 @@ opj_codec_t* OPJ_CALLCONV opj_create_decompress(OPJ_CODEC_FORMAT p_format)
                          OPJ_BYTE*,
                          OPJ_UINT32,
                          struct opj_stream_private *,
-                         struct opj_event_mgr *)) opj_j2k_decode_tile;
+                         struct opj_event_mgr *,
+                         struct opj_cancel *)) opj_j2k_decode_tile;
 
         l_codec->m_codec_data.m_decompression.opj_set_decode_area =
             (OPJ_BOOL(*)(void *,
@@ -327,7 +340,8 @@ opj_codec_t* OPJ_CALLCONV opj_create_decompress(OPJ_CODEC_FORMAT p_format)
             (OPJ_BOOL(*)(void *,
                          OPJ_UINT32, OPJ_BYTE*, OPJ_UINT32,
                          struct opj_stream_private *,
-                         struct opj_event_mgr *)) opj_jp2_decode_tile;
+                         struct opj_event_mgr *,
+                         struct opj_cancel *)) opj_jp2_decode_tile;
 
         l_codec->m_codec_data.m_decompression.opj_destroy = (void (*)(
                     void *))opj_jp2_destroy;
@@ -381,6 +395,7 @@ opj_codec_t* OPJ_CALLCONV opj_create_decompress(OPJ_CODEC_FORMAT p_format)
     }
 
     opj_set_default_event_handler(&(l_codec->m_event_mgr));
+    l_codec->p_cancel = 00;
     return (opj_codec_t*) l_codec;
 }
 
@@ -607,7 +622,8 @@ OPJ_BOOL OPJ_CALLCONV opj_decode_tile_data(opj_codec_t *p_codec,
                    p_data,
                    p_data_size,
                    l_stream,
-                   &(l_codec->m_event_mgr));
+                   &(l_codec->m_event_mgr),
+                   l_codec->p_cancel);
     }
     return OPJ_FALSE;
 }
@@ -1142,3 +1158,42 @@ void OPJ_CALLCONV opj_image_data_free(void* ptr)
     /* printf("opj_image_data_free %p\n", ptr); */
     opj_aligned_free(ptr);
 }
+
+struct opj_cancel
+{
+    atomic_bool cancel;
+};
+
+typedef struct opj_cancel opj_cancel_t;
+
+opj_cancel_t* OPJ_CALLCONV opj_create_cancel(void)
+{
+    opj_cancel_t* cancel = opj_malloc(sizeof(opj_cancel_t));
+    if (! cancel) {
+        return NULL;
+    }
+
+    cancel->cancel = OPJ_FALSE;
+    return cancel;
+}
+
+void opj_destroy_cancel(opj_cancel_t* cancel)
+{
+    opj_free(cancel);
+}
+
+void opj_cancel(opj_cancel_t* cancel)
+{
+    cancel->cancel = OPJ_TRUE;
+}
+
+void opj_reset(opj_cancel_t* cancel)
+{
+    cancel->cancel = OPJ_FALSE;
+}
+
+OPJ_BOOL opj_should_cancel(opj_cancel_t* cancel)
+{
+    return cancel && cancel->cancel;
+}
+

@@ -708,12 +708,13 @@ void j2k_destroy_cstr_index(opj_codestream_index_t *p_cstr_ind);
  * @param   p_stream            the stream to write data to.
  * @param   p_manager   the user event manager.
  */
-OPJ_BOOL opj_j2k_decode_tile(opj_j2k_t * p_j2k,
-                             OPJ_UINT32 p_tile_index,
-                             OPJ_BYTE * p_data,
-                             OPJ_UINT32 p_data_size,
-                             opj_stream_private_t *p_stream,
-                             opj_event_mgr_t * p_manager);
+OPJ_RESULT opj_j2k_decode_tile(opj_j2k_t * p_j2k,
+                               OPJ_UINT32 p_tile_index,
+                               OPJ_BYTE * p_data,
+                               OPJ_UINT32 p_data_size,
+                               opj_stream_private_t *p_stream,
+                               opj_event_mgr_t * p_manager,
+			       opj_cancel_t * p_cancel);
 
 /**
  * Reads a tile header.

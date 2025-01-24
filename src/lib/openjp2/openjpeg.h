@@ -117,6 +117,11 @@ typedef int OPJ_BOOL;
 #define OPJ_TRUE 1
 #define OPJ_FALSE 0
 
+typedef int OPJ_RESULT;
+#define OPJ_SUCCESS OPJ_TRUE
+#define OPJ_FAILURE OPJ_FALSE
+#define OPJ_CANCEL 2
+
 typedef char          OPJ_CHAR;
 typedef float         OPJ_FLOAT32;
 typedef double        OPJ_FLOAT64;
@@ -1159,6 +1164,16 @@ OPJ_API void* OPJ_CALLCONV opj_image_data_alloc(OPJ_SIZE_T size);
  * @since 2.2.0
 */
 OPJ_API void OPJ_CALLCONV opj_image_data_free(void* ptr);
+
+struct opj_cancel;
+typedef struct opj_cancel opj_cancel_t;
+
+OPJ_API OPJ_BOOL OPJ_CALLCONV opj_set_cancel(opj_codec_t * p_codec, opj_cancel_t * p_cancel);
+OPJ_API opj_cancel_t* OPJ_CALLCONV opj_create_cancel(void);
+OPJ_API void OPJ_CALLCONV opj_destroy_cancel(opj_cancel_t * p_cancel);
+OPJ_API void OPJ_CALLCONV opj_cancel(opj_cancel_t * p_cancel);
+OPJ_API void OPJ_CALLCONV opj_reset(opj_cancel_t * p_cancel);
+OPJ_API OPJ_BOOL OPJ_CALLCONV opj_should_cancel(opj_cancel_t * p_cancel);
 
 /*
 ==========================================================

@@ -77,7 +77,8 @@ typedef struct opj_codec_private {
                                             OPJ_BYTE * p_data,
                                             OPJ_UINT32 p_data_size,
                                             struct opj_stream_private * p_cio,
-                                            struct opj_event_mgr * p_manager);
+                                            struct opj_event_mgr * p_manager,
+					    struct opj_cancel * p_cancel);
 
             /** Reading function used after codestream if necessary */
             OPJ_BOOL(* opj_end_decompress)(void *p_codec,
@@ -162,6 +163,7 @@ typedef struct opj_codec_private {
     void * m_codec;
     /** Event handler */
     opj_event_mgr_t m_event_mgr;
+    opj_cancel_t* p_cancel;
     /** Flag to indicate if the codec is used to decode or encode*/
     OPJ_BOOL is_decompressor;
     void (*opj_dump_codec)(void * p_codec, OPJ_INT32 info_flag,

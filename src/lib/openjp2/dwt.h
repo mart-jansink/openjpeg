@@ -69,9 +69,9 @@ Apply a reversible inverse DWT transform to a component of an image.
 @param tilec Tile component information (current tile)
 @param numres Number of resolution levels to decode
 */
-OPJ_BOOL opj_dwt_decode(opj_tcd_t *p_tcd,
-                        opj_tcd_tilecomp_t* tilec,
-                        OPJ_UINT32 numres);
+OPJ_RESULT opj_dwt_decode(opj_tcd_t *p_tcd,
+                          opj_tcd_tilecomp_t* tilec,
+                          OPJ_UINT32 numres, opj_cancel_t* p_cancel);
 
 /**
 Get the norm of a wavelet function of a subband at a specified level for the reversible 5-3 DWT.
@@ -95,9 +95,9 @@ Apply an irreversible inverse DWT transform to a component of an image.
 @param tilec Tile component information (current tile)
 @param numres Number of resolution levels to decode
 */
-OPJ_BOOL opj_dwt_decode_real(opj_tcd_t *p_tcd,
-                             opj_tcd_tilecomp_t* OPJ_RESTRICT tilec,
-                             OPJ_UINT32 numres);
+OPJ_RESULT opj_dwt_decode_real(opj_tcd_t *p_tcd,
+                               opj_tcd_tilecomp_t* OPJ_RESTRICT tilec,
+                               OPJ_UINT32 numres, opj_cancel_t* cancel);
 
 /**
 Get the norm of a wavelet function of a subband at a specified level for the irreversible 9-7 DWT

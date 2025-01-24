@@ -156,17 +156,19 @@ Free the memory allocated for encoding
 static void opj_tcd_free_tile(opj_tcd_t *tcd);
 
 
-static OPJ_BOOL opj_tcd_t2_decode(opj_tcd_t *p_tcd,
-                                  OPJ_BYTE * p_src_data,
-                                  OPJ_UINT32 * p_data_read,
-                                  OPJ_UINT32 p_max_src_size,
-                                  opj_codestream_index_t *p_cstr_index,
-                                  opj_event_mgr_t *p_manager);
+static OPJ_RESULT opj_tcd_t2_decode(opj_tcd_t *p_tcd,
+                                    OPJ_BYTE * p_src_data,
+                                    OPJ_UINT32 * p_data_read,
+                                    OPJ_UINT32 p_max_src_size,
+                                    opj_codestream_index_t *p_cstr_index,
+                                    opj_event_mgr_t *p_manager,
+                                    opj_cancel_t *p_cancel);
 
-static OPJ_BOOL opj_tcd_t1_decode(opj_tcd_t *p_tcd,
-                                  opj_event_mgr_t *p_manager);
+static OPJ_RESULT opj_tcd_t1_decode(opj_tcd_t *p_tcd,
+                                    opj_event_mgr_t *p_manager,
+                                    opj_cancel_t *p_cancel);
 
-static OPJ_BOOL opj_tcd_dwt_decode(opj_tcd_t *p_tcd);
+static OPJ_RESULT opj_tcd_dwt_decode(opj_tcd_t *p_tcd, opj_cancel_t *p_cancel);
 
 static OPJ_BOOL opj_tcd_mct_decode(opj_tcd_t *p_tcd,
                                    opj_event_mgr_t *p_manager);
@@ -1542,22 +1544,24 @@ OPJ_BOOL opj_tcd_encode_tile(opj_tcd_t *p_tcd,
     return OPJ_TRUE;
 }
 
-OPJ_BOOL opj_tcd_decode_tile(opj_tcd_t *p_tcd,
-                             OPJ_UINT32 win_x0,
-                             OPJ_UINT32 win_y0,
-                             OPJ_UINT32 win_x1,
-                             OPJ_UINT32 win_y1,
-                             OPJ_UINT32 numcomps_to_decode,
-                             const OPJ_UINT32 *comps_indices,
-                             OPJ_BYTE *p_src,
-                             OPJ_UINT32 p_max_length,
-                             OPJ_UINT32 p_tile_no,
-                             opj_codestream_index_t *p_cstr_index,
-                             opj_event_mgr_t *p_manager
-                            )
+OPJ_RESULT opj_tcd_decode_tile(opj_tcd_t *p_tcd,
+                               OPJ_UINT32 win_x0,
+                               OPJ_UINT32 win_y0,
+                               OPJ_UINT32 win_x1,
+                               OPJ_UINT32 win_y1,
+                               OPJ_UINT32 numcomps_to_decode,
+                               const OPJ_UINT32 *comps_indices,
+                               OPJ_BYTE *p_src,
+                               OPJ_UINT32 p_max_length,
+                               OPJ_UINT32 p_tile_no,
+                               opj_codestream_index_t *p_cstr_index,
+                               opj_event_mgr_t *p_manager,
+                               opj_cancel_t *p_cancel
+                               )
 {
     OPJ_UINT32 l_data_read;
     OPJ_UINT32 compno;
+    OPJ_RESULT r;
 
     p_tcd->tcd_tileno = p_tile_no;
     p_tcd->tcp = &(p_tcd->cp->tcps[p_tile_no]);
@@ -1574,7 +1578,7 @@ OPJ_BOOL opj_tcd_decode_tile(opj_tcd_t *p_tcd,
         OPJ_BOOL* used_component = (OPJ_BOOL*) opj_calloc(sizeof(OPJ_BOOL),
                                    p_tcd->image->numcomps);
         if (used_component == NULL) {
-            return OPJ_FALSE;
+            return OPJ_FAILURE;
         }
         for (compno = 0; compno < numcomps_to_decode; compno++) {
             used_component[ comps_indices[compno] ] = OPJ_TRUE;
@@ -1613,14 +1617,14 @@ OPJ_BOOL opj_tcd_decode_tile(opj_tcd_t *p_tcd,
             if (res_h > 0 && res_w > SIZE_MAX / res_h) {
                 opj_event_msg(p_manager, EVT_ERROR,
                               "Size of tile data exceeds system limits\n");
-                return OPJ_FALSE;
+                return OPJ_FAILURE;
             }
             l_data_size = res_w * res_h;
 
             if (SIZE_MAX / sizeof(OPJ_UINT32) < l_data_size) {
                 opj_event_msg(p_manager, EVT_ERROR,
                               "Size of tile data exceeds system limits\n");
-                return OPJ_FALSE;
+                return OPJ_FAILURE;
             }
             l_data_size *= sizeof(OPJ_UINT32);
 
@@ -1629,7 +1633,7 @@ OPJ_BOOL opj_tcd_decode_tile(opj_tcd_t *p_tcd,
             if (!opj_alloc_tile_component_data(tilec)) {
                 opj_event_msg(p_manager, EVT_ERROR,
                               "Size of tile data exceeds system limits\n");
-                return OPJ_FALSE;
+                return OPJ_FAILURE;
             }
         }
     } else {
@@ -1666,7 +1670,7 @@ OPJ_BOOL opj_tcd_decode_tile(opj_tcd_t *p_tcd,
                 /* Upper level logic should not even try to decode that tile */
                 opj_event_msg(p_manager, EVT_ERROR,
                               "Invalid tilec->win_xxx values\n");
-                return OPJ_FALSE;
+                return OPJ_FAILURE;
             }
 
             for (resno = 0; resno < tilec->numresolutions; ++resno) {
@@ -1707,20 +1711,29 @@ OPJ_BOOL opj_tcd_decode_tile(opj_tcd_t *p_tcd,
     /* << INDEX */
 #endif
 
+    if (opj_should_cancel(p_cancel)) {
+        return OPJ_CANCEL;
+    }
+
     /*--------------TIER2------------------*/
     /* FIXME _ProfStart(PGROUP_T2); */
     l_data_read = 0;
-    if (! opj_tcd_t2_decode(p_tcd, p_src, &l_data_read, p_max_length, p_cstr_index,
-                            p_manager)) {
-        return OPJ_FALSE;
+    r = opj_tcd_t2_decode(p_tcd, p_src, &l_data_read, p_max_length, p_cstr_index, p_manager, p_cancel);
+    if (r != OPJ_SUCCESS) {
+        return r;
     }
     /* FIXME _ProfStop(PGROUP_T2); */
+
+    if (opj_should_cancel(p_cancel)) {
+        return OPJ_CANCEL;
+    }
 
     /*------------------TIER1-----------------*/
 
     /* FIXME _ProfStart(PGROUP_T1); */
-    if (! opj_tcd_t1_decode(p_tcd, p_manager)) {
-        return OPJ_FALSE;
+    r = opj_tcd_t1_decode(p_tcd, p_manager, p_cancel);
+    if (r != OPJ_SUCCESS) {
+        return r;
     }
     /* FIXME _ProfStop(PGROUP_T1); */
 
@@ -1747,13 +1760,13 @@ OPJ_BOOL opj_tcd_decode_tile(opj_tcd_t *p_tcd,
                 if (w > SIZE_MAX / h) {
                     opj_event_msg(p_manager, EVT_ERROR,
                                   "Size of tile data exceeds system limits\n");
-                    return OPJ_FALSE;
+                    return OPJ_FAILURE;
                 }
                 l_data_size = w * h;
                 if (l_data_size > SIZE_MAX / sizeof(OPJ_INT32)) {
                     opj_event_msg(p_manager, EVT_ERROR,
                                   "Size of tile data exceeds system limits\n");
-                    return OPJ_FALSE;
+                    return OPJ_FAILURE;
                 }
                 l_data_size *= sizeof(OPJ_INT32);
 
@@ -1761,39 +1774,51 @@ OPJ_BOOL opj_tcd_decode_tile(opj_tcd_t *p_tcd,
                 if (tilec->data_win == NULL) {
                     opj_event_msg(p_manager, EVT_ERROR,
                                   "Size of tile data exceeds system limits\n");
-                    return OPJ_FALSE;
+                    return OPJ_FAILURE;
                 }
             }
         }
     }
 
+    if (opj_should_cancel(p_cancel)) {
+        return OPJ_CANCEL;
+    }
+
     /*----------------DWT---------------------*/
 
     /* FIXME _ProfStart(PGROUP_DWT); */
-    if
-    (! opj_tcd_dwt_decode(p_tcd)) {
-        return OPJ_FALSE;
+    r = opj_tcd_dwt_decode(p_tcd, p_cancel);
+    if (r != OPJ_SUCCESS) {
+        return r;
     }
     /* FIXME _ProfStop(PGROUP_DWT); */
+
+    if (opj_should_cancel(p_cancel)) {
+        return OPJ_CANCEL;
+    }
 
     /*----------------MCT-------------------*/
     /* FIXME _ProfStart(PGROUP_MCT); */
     if
     (! opj_tcd_mct_decode(p_tcd, p_manager)) {
-        return OPJ_FALSE;
+        return OPJ_FAILURE;
     }
     /* FIXME _ProfStop(PGROUP_MCT); */
+
+    if (opj_should_cancel(p_cancel)) {
+        return OPJ_CANCEL;
+    }
 
     /* FIXME _ProfStart(PGROUP_DC_SHIFT); */
     if
     (! opj_tcd_dc_level_shift_decode(p_tcd)) {
-        return OPJ_FALSE;
+        return OPJ_FAILURE;
     }
     /* FIXME _ProfStop(PGROUP_DC_SHIFT); */
 
 
     /*---------------TILE-------------------*/
-    return OPJ_TRUE;
+    return OPJ_SUCCESS;
 }
 
 OPJ_BOOL opj_tcd_update_tile_data(opj_tcd_t *p_tcd,
@@ -2006,22 +2031,24 @@ static void opj_tcd_free_tile(opj_tcd_t *p_tcd)
 }
 
 
-static OPJ_BOOL opj_tcd_t2_decode(opj_tcd_t *p_tcd,
-                                  OPJ_BYTE * p_src_data,
-                                  OPJ_UINT32 * p_data_read,
-                                  OPJ_UINT32 p_max_src_size,
-                                  opj_codestream_index_t *p_cstr_index,
-                                  opj_event_mgr_t *p_manager
-                                 )
+static OPJ_RESULT opj_tcd_t2_decode(opj_tcd_t *p_tcd,
+                                    OPJ_BYTE * p_src_data,
+                                    OPJ_UINT32 * p_data_read,
+                                    OPJ_UINT32 p_max_src_size,
+                                    opj_codestream_index_t *p_cstr_index,
+                                    opj_event_mgr_t *p_manager,
+                                    opj_cancel_t *p_cancel
+                                   )
 {
     opj_t2_t * l_t2;
+    OPJ_RESULT r;
 
     l_t2 = opj_t2_create(p_tcd->image, p_tcd->cp);
     if (l_t2 == 00) {
-        return OPJ_FALSE;
+        return OPJ_FAILURE;
     }
 
-    if (! opj_t2_decode_packets(
+    r = opj_t2_decode_packets(
                 p_tcd,
                 l_t2,
                 p_tcd->tcd_tileno,
@@ -2030,18 +2057,21 @@ static OPJ_BOOL opj_tcd_t2_decode(opj_tcd_t *p_tcd,
                 p_data_read,
                 p_max_src_size,
                 p_cstr_index,
-                p_manager)) {
+                p_manager,
+                p_cancel);
+
+    if (r != OPJ_SUCCESS) {
         opj_t2_destroy(l_t2);
-        return OPJ_FALSE;
+        return r;
     }
 
     opj_t2_destroy(l_t2);
 
     /*---------------CLEAN-------------------*/
-    return OPJ_TRUE;
+    return OPJ_SUCCESS;
 }
 
-static OPJ_BOOL opj_tcd_t1_decode(opj_tcd_t *p_tcd, opj_event_mgr_t *p_manager)
+static OPJ_RESULT opj_tcd_t1_decode(opj_tcd_t *p_tcd, opj_event_mgr_t *p_manager, opj_cancel_t *p_cancel)
 {
     OPJ_UINT32 compno;
     opj_tcd_tile_t * l_tile = p_tcd->tcd_image->tiles;
@@ -2066,8 +2096,8 @@ static OPJ_BOOL opj_tcd_t1_decode(opj_tcd_t *p_tcd, opj_event_mgr_t *p_manager)
         }
 
         opj_t1_decode_cblks(p_tcd, &ret, l_tile_comp, l_tccp,
-                            p_manager, p_manager_mutex, check_pterm);
-        if (!ret) {
+                            p_manager, p_manager_mutex, check_pterm, p_cancel);
+        if (ret != OPJ_SUCCESS) {
             break;
         }
     }
@@ -2080,7 +2110,7 @@ static OPJ_BOOL opj_tcd_t1_decode(opj_tcd_t *p_tcd, opj_event_mgr_t *p_manager)
 }
 
 
-static OPJ_BOOL opj_tcd_dwt_decode(opj_tcd_t *p_tcd)
+static OPJ_RESULT opj_tcd_dwt_decode(opj_tcd_t *p_tcd, opj_cancel_t *p_cancel)
 {
     OPJ_UINT32 compno;
     opj_tcd_tile_t * l_tile = p_tcd->tcd_image->tiles;
@@ -2095,20 +2125,20 @@ static OPJ_BOOL opj_tcd_dwt_decode(opj_tcd_t *p_tcd)
         }
 
         if (l_tccp->qmfbid == 1) {
-            if (! opj_dwt_decode(p_tcd, l_tile_comp,
-                                 l_img_comp->resno_decoded + 1)) {
-                return OPJ_FALSE;
+            OPJ_RESULT r = opj_dwt_decode(p_tcd, l_tile_comp, l_img_comp->resno_decoded + 1, p_cancel);
+            if (r != OPJ_SUCCESS) {
+                return r;
             }
         } else {
-            if (! opj_dwt_decode_real(p_tcd, l_tile_comp,
-                                      l_img_comp->resno_decoded + 1)) {
-                return OPJ_FALSE;
+            OPJ_RESULT r = opj_dwt_decode_real(p_tcd, l_tile_comp, l_img_comp->resno_decoded + 1, p_cancel);
+            if (r != OPJ_SUCCESS) {
+                return r;
             }
         }
 
     }
 
-    return OPJ_TRUE;
+    return OPJ_SUCCESS;
 }
 
 static OPJ_BOOL opj_tcd_mct_decode(opj_tcd_t *p_tcd, opj_event_mgr_t *p_manager)

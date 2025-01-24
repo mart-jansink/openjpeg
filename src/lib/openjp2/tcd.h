@@ -425,7 +425,8 @@ OPJ_BOOL opj_tcd_decode_tile(opj_tcd_t *tcd,
                              OPJ_UINT32 len,
                              OPJ_UINT32 tileno,
                              opj_codestream_index_t *cstr_info,
-                             opj_event_mgr_t *manager);
+                             opj_event_mgr_t *manager,
+			     opj_cancel_t *cancel);
 
 
 /**

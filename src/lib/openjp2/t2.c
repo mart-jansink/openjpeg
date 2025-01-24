@@ -390,15 +390,16 @@ static void opj_null_jas_fprintf(FILE* file, const char * format, ...)
 #define JAS_FPRINTF opj_null_jas_fprintf
 #endif
 
-OPJ_BOOL opj_t2_decode_packets(opj_tcd_t* tcd,
-                               opj_t2_t *p_t2,
-                               OPJ_UINT32 p_tile_no,
-                               opj_tcd_tile_t *p_tile,
-                               OPJ_BYTE *p_src,
-                               OPJ_UINT32 * p_data_read,
-                               OPJ_UINT32 p_max_len,
-                               opj_codestream_index_t *p_cstr_index,
-                               opj_event_mgr_t *p_manager)
+OPJ_RESULT opj_t2_decode_packets(opj_tcd_t* tcd,
+                                 opj_t2_t *p_t2,
+                                 OPJ_UINT32 p_tile_no,
+                                 opj_tcd_tile_t *p_tile,
+                                 OPJ_BYTE *p_src,
+                                 OPJ_UINT32 * p_data_read,
+                                 OPJ_UINT32 p_max_len,
+                                 opj_codestream_index_t *p_cstr_index,
+                                 opj_event_mgr_t *p_manager,
+                                 opj_cancel_t *p_cancel)
 {
     OPJ_BYTE *l_current_data = p_src;
     opj_pi_iterator_t *l_pi = 00;
@@ -461,6 +462,10 @@ OPJ_BOOL opj_t2_decode_packets(opj_tcd_t* tcd,
                         "packet offset=00000166 prg=%d cmptno=%02d rlvlno=%02d prcno=%03d lyrno=%02d\n\n",
                         l_current_pi->poc.prg1, l_current_pi->compno, l_current_pi->resno,
                         l_current_pi->precno, l_current_pi->layno);
+
+            if (opj_should_cancel(p_cancel)) {
+                return OPJ_CANCEL;
+            }
 
             /* If the packet layer is greater or equal than the maximum */
             /* number of layers, skip the packet */

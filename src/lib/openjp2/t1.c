@@ -1833,12 +1833,13 @@ static void opj_t1_clbl_decode_processor(void* user_data, opj_tls_t* tls)
 
 
 void opj_t1_decode_cblks(opj_tcd_t* tcd,
-                         volatile OPJ_BOOL* pret,
+                         volatile OPJ_RESULT* pret,
                          opj_tcd_tilecomp_t* tilec,
                          opj_tccp_t* tccp,
                          opj_event_mgr_t *p_manager,
                          opj_mutex_t* p_manager_mutex,
-                         OPJ_BOOL check_pterm
+                         OPJ_BOOL check_pterm,
+                         opj_cancel_t *p_cancel
                         )
 {
     opj_thread_pool_t* tp = tcd->thread_pool;
@@ -1851,12 +1852,23 @@ void opj_t1_decode_cblks(opj_tcd_t* tcd,
 
     for (resno = 0; resno < tilec->minimum_num_resolutions; ++resno) {
         opj_tcd_resolution_t* res = &tilec->resolutions[resno];
+        if (opj_should_cancel(p_cancel)) {
+            *pret = OPJ_CANCEL;
+        }
 
         for (bandno = 0; bandno < res->numbands; ++bandno) {
             opj_tcd_band_t* OPJ_RESTRICT band = &res->bands[bandno];
 
+            if (opj_should_cancel(p_cancel)) {
+                *pret = OPJ_CANCEL;
+            }
+
             for (precno = 0; precno < res->pw * res->ph; ++precno) {
                 opj_tcd_precinct_t* precinct = &band->precincts[precno];
+
+                if (opj_should_cancel(p_cancel)) {
+                    *pret = OPJ_CANCEL;
+                }
 
                 if (!opj_tcd_is_subband_area_of_interest(tcd,
                         tilec->compno,
@@ -1866,7 +1878,7 @@ void opj_t1_decode_cblks(opj_tcd_t* tcd,
                         (OPJ_UINT32)precinct->y0,
                         (OPJ_UINT32)precinct->x1,
                         (OPJ_UINT32)precinct->y1)) {
-                    for (cblkno = 0; cblkno < precinct->cw * precinct->ch; ++cblkno) {
+            for (cblkno = 0; cblkno < precinct->cw * precinct->ch; ++cblkno) {
                         opj_tcd_cblk_dec_t* cblk = &precinct->cblks.dec[cblkno];
                         if (cblk->decoded_data) {
 #ifdef DEBUG_VERBOSE
@@ -1883,6 +1895,10 @@ void opj_t1_decode_cblks(opj_tcd_t* tcd,
                 for (cblkno = 0; cblkno < precinct->cw * precinct->ch; ++cblkno) {
                     opj_tcd_cblk_dec_t* cblk = &precinct->cblks.dec[cblkno];
                     opj_t1_cblk_decode_processing_job_t* job;
+
+                    if (opj_should_cancel(p_cancel)) {
+                        *pret = OPJ_FALSE;
+                    }
 
                     if (!opj_tcd_is_subband_area_of_interest(tcd,
                             tilec->compno,
@@ -1925,7 +1941,7 @@ void opj_t1_decode_cblks(opj_tcd_t* tcd,
                     job = (opj_t1_cblk_decode_processing_job_t*) opj_calloc(1,
                             sizeof(opj_t1_cblk_decode_processing_job_t));
                     if (!job) {
-                        *pret = OPJ_FALSE;
+                        *pret = OPJ_FAILURE;
                         return;
                     }
                     job->whole_tile_decoding = tcd->whole_tile_decoding;

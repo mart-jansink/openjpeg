@@ -139,8 +139,8 @@ static void opj_dwt_encode_stepsize(OPJ_INT32 stepsize, OPJ_INT32 numbps,
 /**
 Inverse wavelet transform in 2-D.
 */
-static OPJ_BOOL opj_dwt_decode_tile(opj_thread_pool_t* tp,
-                                    opj_tcd_tilecomp_t* tilec, OPJ_UINT32 i);
+static OPJ_RESULT opj_dwt_decode_tile(opj_thread_pool_t* tp,
+                                      opj_tcd_tilecomp_t* tilec, OPJ_UINT32 i, opj_cancel_t* cancel);
 
 static OPJ_BOOL opj_dwt_decode_partial_tile(
     opj_tcd_tilecomp_t* tilec,
@@ -1910,11 +1910,11 @@ OPJ_BOOL opj_dwt_encode(opj_tcd_t *p_tcd,
 /* <summary>                            */
 /* Inverse 5-3 wavelet transform in 2-D. */
 /* </summary>                           */
-OPJ_BOOL opj_dwt_decode(opj_tcd_t *p_tcd, opj_tcd_tilecomp_t* tilec,
-                        OPJ_UINT32 numres)
+OPJ_RESULT opj_dwt_decode(opj_tcd_t *p_tcd, opj_tcd_tilecomp_t* tilec,
+                          OPJ_UINT32 numres, opj_cancel_t* cancel)
 {
     if (p_tcd->whole_tile_decoding) {
-        return opj_dwt_decode_tile(p_tcd->thread_pool, tilec, numres);
+        return opj_dwt_decode_tile(p_tcd->thread_pool, tilec, numres, cancel);
     } else {
         return opj_dwt_decode_partial_tile(tilec, numres);
     }
@@ -2064,8 +2064,8 @@ static void opj_dwt_decode_v_func(void* user_data, opj_tls_t* tls)
 /* <summary>                            */
 /* Inverse wavelet transform in 2-D.    */
 /* </summary>                           */
-static OPJ_BOOL opj_dwt_decode_tile(opj_thread_pool_t* tp,
-                                    opj_tcd_tilecomp_t* tilec, OPJ_UINT32 numres)
+static OPJ_RESULT opj_dwt_decode_tile(opj_thread_pool_t* tp,
+                                      opj_tcd_tilecomp_t* tilec, OPJ_UINT32 numres, opj_cancel_t* cancel)
 {
     opj_dwt_t h;
     opj_dwt_t v;
@@ -2086,14 +2086,14 @@ static OPJ_BOOL opj_dwt_decode_tile(opj_thread_pool_t* tp,
     /* Not entirely sure for the return code of w == 0 which is triggered per */
     /* https://github.com/uclouvain/openjpeg/issues/1505 */
     if (numres == 1U || w == 0) {
-        return OPJ_TRUE;
+        return OPJ_SUCCESS;
     }
     num_threads = opj_thread_pool_get_thread_count(tp);
     h_mem_size = opj_dwt_max_resolution(tr, numres);
     /* overflow check */
     if (h_mem_size > (SIZE_MAX / PARALLEL_COLS_53 / sizeof(OPJ_INT32))) {
         /* FIXME event manager error callback */
-        return OPJ_FALSE;
+        return OPJ_FAILURE;
     }
     /* We need PARALLEL_COLS_53 times the height of the array, */
     /* since for the vertical pass */
@@ -2102,7 +2102,7 @@ static OPJ_BOOL opj_dwt_decode_tile(opj_thread_pool_t* tp,
     h.mem = (OPJ_INT32*)opj_aligned_32_malloc(h_mem_size);
     if (! h.mem) {
         /* FIXME event manager error callback */
-        return OPJ_FALSE;
+        return OPJ_FAILURE;
     }
 
     v.mem = h.mem;
@@ -2110,6 +2110,10 @@ static OPJ_BOOL opj_dwt_decode_tile(opj_thread_pool_t* tp,
     while (--numres) {
         OPJ_INT32 * OPJ_RESTRICT tiledp = tilec->data;
         OPJ_UINT32 j;
+
+        if (opj_should_cancel(cancel)) {
+            return OPJ_CANCEL;
+        }
 
         ++tr;
         h.sn = (OPJ_INT32)rw;
@@ -2145,7 +2149,7 @@ static OPJ_BOOL opj_dwt_decode_tile(opj_thread_pool_t* tp,
                     /* FIXME event manager error callback */
                     opj_thread_pool_wait_completion(tp, 0);
                     opj_aligned_free(h.mem);
-                    return OPJ_FALSE;
+                    return OPJ_FAILURE;
                 }
                 job->h = h;
                 job->rw = rw;
@@ -2162,7 +2166,7 @@ static OPJ_BOOL opj_dwt_decode_tile(opj_thread_pool_t* tp,
                     opj_thread_pool_wait_completion(tp, 0);
                     opj_free(job);
                     opj_aligned_free(h.mem);
-                    return OPJ_FALSE;
+                    return OPJ_FAILURE;
                 }
                 opj_thread_pool_submit_job(tp, opj_dwt_decode_h_func, job);
             }
@@ -2200,7 +2204,7 @@ static OPJ_BOOL opj_dwt_decode_tile(opj_thread_pool_t* tp,
                     /* FIXME event manager error callback */
                     opj_thread_pool_wait_completion(tp, 0);
                     opj_aligned_free(v.mem);
-                    return OPJ_FALSE;
+                    return OPJ_FAILURE;
                 }
                 job->v = v;
                 job->rh = rh;
@@ -2217,7 +2221,7 @@ static OPJ_BOOL opj_dwt_decode_tile(opj_thread_pool_t* tp,
                     opj_thread_pool_wait_completion(tp, 0);
                     opj_free(job);
                     opj_aligned_free(v.mem);
-                    return OPJ_FALSE;
+                    return OPJ_FAILURE;
                 }
                 opj_thread_pool_submit_job(tp, opj_dwt_decode_v_func, job);
             }
@@ -2225,7 +2229,7 @@ static OPJ_BOOL opj_dwt_decode_tile(opj_thread_pool_t* tp,
         }
     }
     opj_aligned_free(h.mem);
-    return OPJ_TRUE;
+    return OPJ_SUCCESS;
 }
 
 static void opj_dwt_interleave_partial_h(OPJ_INT32 *dest,
@@ -3300,9 +3304,9 @@ static void opj_dwt97_decode_v_func(void* user_data, opj_tls_t* tls)
 /* Inverse 9-7 wavelet transform in 2-D. */
 /* </summary>                            */
 static
-OPJ_BOOL opj_dwt_decode_tile_97(opj_thread_pool_t* tp,
-                                opj_tcd_tilecomp_t* OPJ_RESTRICT tilec,
-                                OPJ_UINT32 numres)
+OPJ_RESULT opj_dwt_decode_tile_97(opj_thread_pool_t* tp,
+                                  opj_tcd_tilecomp_t* OPJ_RESTRICT tilec,
+                                  OPJ_UINT32 numres, opj_cancel_t* p_cancel)
 {
     opj_v8dwt_t h;
     opj_v8dwt_t v;
@@ -3322,25 +3326,29 @@ OPJ_BOOL opj_dwt_decode_tile_97(opj_thread_pool_t* tp,
     const int num_threads = opj_thread_pool_get_thread_count(tp);
 
     if (numres == 1) {
-        return OPJ_TRUE;
+        return OPJ_SUCCESS;
     }
 
     l_data_size = opj_dwt_max_resolution(res, numres);
     /* overflow check */
     if (l_data_size > (SIZE_MAX / sizeof(opj_v8_t))) {
         /* FIXME event manager error callback */
-        return OPJ_FALSE;
+        return OPJ_FAILURE;
     }
     h.wavelet = (opj_v8_t*) opj_aligned_malloc(l_data_size * sizeof(opj_v8_t));
     if (!h.wavelet) {
         /* FIXME event manager error callback */
-        return OPJ_FALSE;
+        return OPJ_FAILURE;
     }
     v.wavelet = h.wavelet;
 
     while (--numres) {
         OPJ_FLOAT32 * OPJ_RESTRICT aj = (OPJ_FLOAT32*) tilec->data;
         OPJ_UINT32 j;
+
+        if (opj_should_cancel(p_cancel)) {
+            return OPJ_FAILURE;
+        }
 
         h.sn = (OPJ_INT32)rw;
         v.sn = (OPJ_INT32)rh;
@@ -3397,14 +3405,14 @@ OPJ_BOOL opj_dwt_decode_tile_97(opj_thread_pool_t* tp,
                 if (!job) {
                     opj_thread_pool_wait_completion(tp, 0);
                     opj_aligned_free(h.wavelet);
-                    return OPJ_FALSE;
+                    return OPJ_FAILURE;
                 }
                 job->h.wavelet = (opj_v8_t*)opj_aligned_malloc(l_data_size * sizeof(opj_v8_t));
                 if (!job->h.wavelet) {
                     opj_thread_pool_wait_completion(tp, 0);
                     opj_free(job);
                     opj_aligned_free(h.wavelet);
-                    return OPJ_FALSE;
+                    return OPJ_FAILURE;
                 }
                 job->h.dn = h.dn;
                 job->h.sn = h.sn;
@@ -3757,12 +3765,12 @@ OPJ_BOOL opj_dwt_decode_partial_97(opj_tcd_tilecomp_t* OPJ_RESTRICT tilec,
 }
 
 
-OPJ_BOOL opj_dwt_decode_real(opj_tcd_t *p_tcd,
-                             opj_tcd_tilecomp_t* OPJ_RESTRICT tilec,
-                             OPJ_UINT32 numres)
+OPJ_RESULT opj_dwt_decode_real(opj_tcd_t *p_tcd,
+                               opj_tcd_tilecomp_t* OPJ_RESTRICT tilec,
+                               OPJ_UINT32 numres, opj_cancel_t* cancel)
 {
     if (p_tcd->whole_tile_decoding) {
-        return opj_dwt_decode_tile_97(p_tcd->thread_pool, tilec, numres);
+        return opj_dwt_decode_tile_97(p_tcd->thread_pool, tilec, numres, cancel);
     } else {
         return opj_dwt_decode_partial_97(tilec, numres);
     }
