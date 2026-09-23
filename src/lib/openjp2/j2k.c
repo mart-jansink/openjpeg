@@ -17,6 +17,7 @@
  * Copyright (c) 2011-2012, Centre National d'Etudes Spatiales (CNES), France
  * Copyright (c) 2012, CS Systemes d'Information, France
  * Copyright (c) 2017, IntoPIX SA <support@intopix.com>
+ * Copyright (c) 2026, CtrlMovie AG
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -5491,6 +5492,54 @@ static OPJ_BOOL opj_j2k_update_rates(opj_j2k_t *p_j2k,
             p_j2k->m_specific_param.m_encoder.m_tlm_sot_offsets_buffer;
     }
 
+    /* Exact codestream budget (CtrlMovie fork). The float rates above only */
+    /* approximate max_cs_size and miss some fixed bytes, so frames bound by */
+    /* the codestream limit could end a few bytes over it. Here the bytes   */
+    /* outside the rate-controlled packets are counted exactly or bounded   */
+    /* from above: the main header as written so far (SOC..COM, including  */
+    /* the TLM with its final size and the POC), EOC, and per tile-part the */
+    /* SOT marker segment (12) and SOD (2), plus the tile-part POC and PLT  */
+    /* upper bounds when those are written. The remainder is shared between */
+    /* the tiles by area, rounding down, and caps the packet bytes of each  */
+    /* tile in opj_tcd_rateallocate().                                      */
+    if (l_cp->m_specific_param.m_enc.m_max_cs_size) {
+        const OPJ_UINT64 l_header = (OPJ_UINT64)opj_stream_tell(p_stream);
+        const OPJ_UINT64 l_max_cs = l_cp->m_specific_param.m_enc.m_max_cs_size;
+        const OPJ_UINT64 l_img_area = (OPJ_UINT64)(l_image->x1 - l_image->x0) *
+                                      (OPJ_UINT64)(l_image->y1 - l_image->y0);
+        const OPJ_UINT64 l_avail = (l_max_cs > l_header + 2) ?
+                                   l_max_cs - l_header - 2 : 0;
+        l_tcp = l_cp->tcps;
+        for (i = 0; i < l_cp->th; ++i) {
+            for (j = 0; j < l_cp->tw; ++j) {
+                OPJ_UINT64 l_share, l_fixed;
+                l_x0 = opj_int_max((OPJ_INT32)(l_cp->tx0 + j * l_cp->tdx),
+                                   (OPJ_INT32)l_image->x0);
+                l_y0 = opj_int_max((OPJ_INT32)(l_cp->ty0 + i * l_cp->tdy),
+                                   (OPJ_INT32)l_image->y0);
+                l_x1 = opj_int_min((OPJ_INT32)(l_cp->tx0 + (j + 1) * l_cp->tdx),
+                                   (OPJ_INT32)l_image->x1);
+                l_y1 = opj_int_min((OPJ_INT32)(l_cp->ty0 + (i + 1) * l_cp->tdy),
+                                   (OPJ_INT32)l_image->y1);
+                l_share = (l_img_area == 0) ? 0 : l_avail *
+                          ((OPJ_UINT64)(l_x1 - l_x0) * (OPJ_UINT64)(l_y1 - l_y0)) /
+                          l_img_area;
+                l_fixed = 14U * (OPJ_UINT64)l_tcp->m_nb_tile_parts;
+                if (!OPJ_IS_CINEMA(l_cp->rsiz) && l_tcp->POC) {
+                    l_fixed += opj_j2k_get_max_poc_size(p_j2k);
+                }
+                if (p_j2k->m_specific_param.m_encoder.m_PLT) {
+                    l_fixed += p_j2k->m_specific_param.m_encoder.m_reserved_bytes_for_PLT +
+                               6U * (OPJ_UINT64)l_tcp->m_nb_tile_parts;
+                }
+                l_share = (l_share > l_fixed) ? l_share - l_fixed : 1;
+                l_tcp->m_max_packet_bytes = (l_share > 0xffffffffU) ? 0xffffffffU :
+                                            (OPJ_UINT32)l_share;
+                ++l_tcp;
+            }
+        }
+    }
+
     return OPJ_TRUE;
 }
 
@@ -7688,6 +7737,8 @@ OPJ_BOOL opj_j2k_setup_encoder(opj_j2k_t *p_j2k,
     OPJ_UINT32 i, j, tileno, numpocs_tile;
     opj_cp_t *cp = 00;
     OPJ_UINT32 cblkw, cblkh;
+    /* max_cs_size given by the caller (and not derived from the rates below) */
+    const OPJ_BOOL l_explicit_max_cs = parameters && parameters->max_cs_size > 0;
 
     if (!p_j2k || !parameters || ! image) {
         return OPJ_FALSE;
@@ -7972,6 +8023,13 @@ OPJ_BOOL opj_j2k_setup_encoder(opj_j2k_t *p_j2k,
     */
     cp->m_specific_param.m_enc.m_max_comp_size = (OPJ_UINT32)
             parameters->max_comp_size;
+    /* An explicit codestream size limit (from the caller or the Cinema/IMF */
+    /* profile) is enforced exactly by opj_j2k_update_rates(); a size only  */
+    /* derived from a compression ratio keeps the historical behaviour.     */
+    cp->m_specific_param.m_enc.m_max_cs_size =
+        ((l_explicit_max_cs || OPJ_IS_CINEMA(parameters->rsiz) ||
+          OPJ_IS_IMF(parameters->rsiz)) && parameters->max_cs_size > 0) ?
+        (OPJ_UINT32)parameters->max_cs_size : 0;
     cp->rsiz = parameters->rsiz;
     if (parameters->cp_fixed_alloc) {
         cp->m_specific_param.m_enc.m_quality_layer_alloc_strategy = FIXED_LAYER;
@@ -11991,7 +12049,7 @@ static OPJ_BOOL opj_j2k_decode_tiles(opj_j2k_t *p_j2k,
 
         /* Transfer TCD data to output image data */
         for (i = 0; i < p_j2k->m_output_image->numcomps; i++) {
-            opj_image_data_free(p_j2k->m_output_image->comps[i].data);
+            opj_image_comp_release_data(&(p_j2k->m_output_image->comps[i]));
             p_j2k->m_output_image->comps[i].data =
                 p_j2k->m_tcd->tcd_image->tiles->comps[i].data;
             p_j2k->m_output_image->comps[i].resno_decoded =
@@ -12342,8 +12400,7 @@ static OPJ_BOOL opj_j2k_move_data_from_codec_to_output_image(opj_j2k_t * p_j2k,
             return OPJ_FALSE;
         }
         for (compno = 0; compno < p_image->numcomps; compno++) {
-            opj_image_data_free(p_image->comps[compno].data);
-            p_image->comps[compno].data = NULL;
+            opj_image_comp_release_data(&(p_image->comps[compno]));
         }
         for (compno = 0;
                 compno < p_j2k->m_specific_param.m_decoder.m_numcomps_to_decode; compno++) {
@@ -12355,12 +12412,14 @@ static OPJ_BOOL opj_j2k_move_data_from_codec_to_output_image(opj_j2k_t * p_j2k,
             newcomps[compno].resno_decoded =
                 p_j2k->m_output_image->comps[src_compno].resno_decoded;
             newcomps[compno].data = p_j2k->m_output_image->comps[src_compno].data;
+            newcomps[compno].data_is_external =
+                p_j2k->m_output_image->comps[src_compno].data_is_external;
             p_j2k->m_output_image->comps[src_compno].data = NULL;
+            p_j2k->m_output_image->comps[src_compno].data_is_external = OPJ_FALSE;
         }
         for (compno = 0; compno < p_image->numcomps; compno++) {
             assert(p_j2k->m_output_image->comps[compno].data == NULL);
-            opj_image_data_free(p_j2k->m_output_image->comps[compno].data);
-            p_j2k->m_output_image->comps[compno].data = NULL;
+            opj_image_comp_release_data(&(p_j2k->m_output_image->comps[compno]));
         }
         p_image->numcomps = p_j2k->m_specific_param.m_decoder.m_numcomps_to_decode;
         opj_free(p_image->comps);
@@ -12369,8 +12428,8 @@ static OPJ_BOOL opj_j2k_move_data_from_codec_to_output_image(opj_j2k_t * p_j2k,
         for (compno = 0; compno < p_image->numcomps; compno++) {
             p_image->comps[compno].resno_decoded =
                 p_j2k->m_output_image->comps[compno].resno_decoded;
-            opj_image_data_free(p_image->comps[compno].data);
-            p_image->comps[compno].data = p_j2k->m_output_image->comps[compno].data;
+            opj_image_comp_move_data(&(p_image->comps[compno]),
+                                     &(p_j2k->m_output_image->comps[compno]));
 #if 0
             char fn[256];
             snprintf(fn, sizeof fn, "/tmp/%d.raw", compno);
@@ -12520,8 +12579,7 @@ OPJ_BOOL opj_j2k_get_tile(opj_j2k_t *p_j2k,
          * later in jp2.c */
         for (compno = p_j2k->m_private_image->numcomps; compno < p_image->numcomps;
                 ++compno) {
-            opj_image_data_free(p_image->comps[compno].data);
-            p_image->comps[compno].data = NULL;
+            opj_image_comp_release_data(&(p_image->comps[compno]));
         }
         p_image->numcomps = p_j2k->m_private_image->numcomps;
     }
@@ -12589,6 +12647,35 @@ OPJ_BOOL opj_j2k_set_decoded_resolution_factor(opj_j2k_t *p_j2k,
 
 /* ----------------------------------------------------------------------- */
 
+/**
+ * Checks that the coding parameters set up by opj_setup_encoder() allow
+ * INPUT_MCT_DOMAIN=YES: a single tile (the planes must be used in place,
+ * because the multi-tile path repacks samples to 8/16 bit according to prec,
+ * which would destroy float bit patterns) and no custom MCT.
+ */
+static OPJ_BOOL opj_j2k_check_input_mct_domain(opj_j2k_t *p_j2k,
+        opj_event_mgr_t * p_manager)
+{
+    opj_cp_t *cp = &(p_j2k->m_cp);
+    OPJ_UINT32 tileno;
+
+    if (cp->tcps == NULL || cp->tw * cp->th != 1) {
+        opj_event_msg(p_manager, EVT_ERROR,
+                      "INPUT_MCT_DOMAIN=YES requires a single-tile encode, "
+                      "set up with opj_setup_encoder() beforehand.\n");
+        return OPJ_FALSE;
+    }
+    for (tileno = 0; tileno < cp->tw * cp->th; tileno++) {
+        if (cp->tcps[tileno].mct == 2) {
+            opj_event_msg(p_manager, EVT_ERROR,
+                          "INPUT_MCT_DOMAIN=YES is not supported with a custom "
+                          "MCT (mct_data / opj_set_MCT).\n");
+            return OPJ_FALSE;
+        }
+    }
+    return OPJ_TRUE;
+}
+
 OPJ_BOOL opj_j2k_encoder_set_extra_options(
     opj_j2k_t *p_j2k,
     const char* const* p_options,
@@ -12640,6 +12727,36 @@ OPJ_BOOL opj_j2k_encoder_set_extra_options(
                     tccp->numgbits = (OPJ_UINT32)numgbits;
                 }
             }
+        } else if (strncmp(*p_option_iter, "METAL_T1=",
+                           strlen("METAL_T1=")) == 0) {
+            if (strcmp(*p_option_iter, "METAL_T1=YES") == 0) {
+#ifndef OPJ_USE_METAL
+                opj_event_msg(p_manager, EVT_WARNING,
+                              "METAL_T1=YES ignored: library built without "
+                              "OPJ_USE_METAL.\n");
+#endif
+                p_j2k->m_specific_param.m_encoder.m_metal_t1 = 2;
+            } else if (strcmp(*p_option_iter, "METAL_T1=NO") == 0) {
+                p_j2k->m_specific_param.m_encoder.m_metal_t1 = 1;
+            } else {
+                opj_event_msg(p_manager, EVT_ERROR,
+                              "Invalid value for option: %s.\n", *p_option_iter);
+                return OPJ_FALSE;
+            }
+        } else if (strncmp(*p_option_iter, "INPUT_MCT_DOMAIN=",
+                           strlen("INPUT_MCT_DOMAIN=")) == 0) {
+            if (strcmp(*p_option_iter, "INPUT_MCT_DOMAIN=YES") == 0) {
+                if (! opj_j2k_check_input_mct_domain(p_j2k, p_manager)) {
+                    return OPJ_FALSE;
+                }
+                p_j2k->m_specific_param.m_encoder.m_input_mct_domain = OPJ_TRUE;
+            } else if (strcmp(*p_option_iter, "INPUT_MCT_DOMAIN=NO") == 0) {
+                p_j2k->m_specific_param.m_encoder.m_input_mct_domain = OPJ_FALSE;
+            } else {
+                opj_event_msg(p_manager, EVT_ERROR,
+                              "Invalid value for option: %s.\n", *p_option_iter);
+                return OPJ_FALSE;
+            }
         } else {
             opj_event_msg(p_manager, EVT_ERROR,
                           "Invalid option: %s.\n", *p_option_iter);
@@ -12651,6 +12768,20 @@ OPJ_BOOL opj_j2k_encoder_set_extra_options(
 }
 
 /* ----------------------------------------------------------------------- */
+
+/* METAL_T1 option, or the OPJ_METAL_T1 environment variable when the option
+ * is not set. Only effective with OPJ_USE_METAL builds. */
+static OPJ_BOOL opj_j2k_use_metal_t1(const opj_j2k_t * p_j2k)
+{
+    const OPJ_UINT32 opt = p_j2k->m_specific_param.m_encoder.m_metal_t1;
+    if (opt != 0) {
+        return opt == 2 ? OPJ_TRUE : OPJ_FALSE;
+    } else {
+        const char* env = getenv("OPJ_METAL_T1");
+        return (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) ?
+               OPJ_TRUE : OPJ_FALSE;
+    }
+}
 
 OPJ_BOOL opj_j2k_encode(opj_j2k_t * p_j2k,
                         opj_stream_private_t *p_stream,
@@ -12683,6 +12814,19 @@ OPJ_BOOL opj_j2k_encode(opj_j2k_t * p_j2k,
         }
 #endif
     }
+    if (p_j2k->m_specific_param.m_encoder.m_input_mct_domain) {
+        if (! opj_j2k_check_input_mct_domain(p_j2k, p_manager)) {
+            return OPJ_FALSE;
+        }
+        if (! l_reuse_data) {
+            opj_event_msg(p_manager, EVT_ERROR,
+                          "INPUT_MCT_DOMAIN=YES requires the image planes to be "
+                          "used in place (16-byte aligned).\n");
+            return OPJ_FALSE;
+        }
+    }
+    p_tcd->input_mct_domain = p_j2k->m_specific_param.m_encoder.m_input_mct_domain;
+    p_tcd->metal_t1 = opj_j2k_use_metal_t1(p_j2k);
     for (i = 0; i < l_nb_tiles; ++i) {
         if (! opj_j2k_pre_write_tile(p_j2k, i, p_stream, p_manager)) {
             if (l_current_data) {
@@ -12798,9 +12942,9 @@ OPJ_BOOL opj_j2k_start_compress(opj_j2k_t *p_j2k,
         OPJ_UINT32 it_comp;
         for (it_comp = 0 ; it_comp < p_image->numcomps; it_comp++) {
             if (p_image->comps[it_comp].data) {
-                p_j2k->m_private_image->comps[it_comp].data = p_image->comps[it_comp].data;
-                p_image->comps[it_comp].data = NULL;
-
+                /* Ownership (data_is_external) moves along with the plane */
+                opj_image_comp_move_data(&(p_j2k->m_private_image->comps[it_comp]),
+                                         &(p_image->comps[it_comp]));
             }
         }
     }
@@ -13573,6 +13717,15 @@ OPJ_BOOL opj_j2k_write_tile(opj_j2k_t * p_j2k,
                             opj_stream_private_t *p_stream,
                             opj_event_mgr_t * p_manager)
 {
+    if (p_j2k->m_specific_param.m_encoder.m_input_mct_domain) {
+        opj_event_msg(p_manager, EVT_ERROR,
+                      "INPUT_MCT_DOMAIN=YES is not supported with opj_write_tile(); "
+                      "use opj_encode().\n");
+        return OPJ_FALSE;
+    }
+    if (p_j2k->m_tcd) {
+        p_j2k->m_tcd->metal_t1 = opj_j2k_use_metal_t1(p_j2k);
+    }
     if (! opj_j2k_pre_write_tile(p_j2k, p_tile_index, p_stream, p_manager)) {
         opj_event_msg(p_manager, EVT_ERROR,
                       "Error while opj_j2k_pre_write_tile with tile index = %d\n", p_tile_index);

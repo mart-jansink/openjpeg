@@ -14,6 +14,7 @@
  * Copyright (c) 2010-2011, Kaori Hagihara
  * Copyright (c) 2008, 2011-2012, Centre National d'Etudes Spatiales (CNES), FR
  * Copyright (c) 2012, CS Systemes d'Information, France
+ * Copyright (c) 2026, CtrlMovie AG
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -1084,6 +1085,7 @@ static OPJ_BOOL opj_jp2_apply_pclr(opj_image_t *image,
         }
 
         /* Palette mapping: */
+        new_comps[i].data_is_external = OPJ_FALSE;
         new_comps[i].data = (OPJ_INT32*)
                             opj_image_data_alloc(sizeof(OPJ_INT32) * old_comps[cmp].w * old_comps[cmp].h);
         if (!new_comps[i].data) {
@@ -1137,9 +1139,7 @@ static OPJ_BOOL opj_jp2_apply_pclr(opj_image_t *image,
 
     max = image->numcomps;
     for (j = 0; j < max; ++j) {
-        if (old_comps[j].data) {
-            opj_image_data_free(old_comps[j].data);
-        }
+        opj_image_comp_release_data(&old_comps[j]);
     }
 
     opj_free(old_comps);

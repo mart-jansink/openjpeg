@@ -5,6 +5,7 @@
  * are granted under this license.
  *
  * Copyright (c) 2005, Herve Drolon, FreeImage Team
+ * Copyright (c) 2026, CtrlMovie AG
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -88,6 +89,51 @@ opj_image_t* OPJ_CALLCONV opj_image_create(OPJ_UINT32 numcmpts,
     return image;
 }
 
+void opj_image_comp_release_data(opj_image_comp_t *comp)
+{
+    if (comp->data && !comp->data_is_external) {
+        opj_image_data_free(comp->data);
+    }
+    comp->data = NULL;
+    comp->data_is_external = OPJ_FALSE;
+}
+
+void opj_image_comp_move_data(opj_image_comp_t *dest, opj_image_comp_t *src)
+{
+    opj_image_comp_release_data(dest);
+    dest->data = src->data;
+    dest->data_is_external = src->data_is_external;
+    src->data = NULL;
+    src->data_is_external = OPJ_FALSE;
+}
+
+OPJ_BOOL OPJ_CALLCONV opj_image_set_external_data(opj_image_t* image,
+        OPJ_UINT32 compno, OPJ_INT32* data)
+{
+    opj_image_comp_t *comp;
+
+    if (image == NULL || image->comps == NULL || compno >= image->numcomps) {
+        return OPJ_FALSE;
+    }
+    comp = &(image->comps[compno]);
+    if (data != NULL) {
+        if (((size_t)data & 0xFU) != 0U) {
+            return OPJ_FALSE;
+        }
+        if (comp->h != 0 &&
+                (OPJ_SIZE_T)comp->w > SIZE_MAX / comp->h / sizeof(OPJ_INT32)) {
+            return OPJ_FALSE;
+        }
+    }
+    if (comp->data != data) {
+        opj_image_comp_release_data(comp);
+    }
+    /* else: re-registering the current plane only changes its ownership */
+    comp->data = data;
+    comp->data_is_external = (data != NULL) ? OPJ_TRUE : OPJ_FALSE;
+    return OPJ_TRUE;
+}
+
 void OPJ_CALLCONV opj_image_destroy(opj_image_t *image)
 {
     if (image) {
@@ -96,10 +142,7 @@ void OPJ_CALLCONV opj_image_destroy(opj_image_t *image)
 
             /* image components */
             for (compno = 0; compno < image->numcomps; compno++) {
-                opj_image_comp_t *image_comp = &(image->comps[compno]);
-                if (image_comp->data) {
-                    opj_image_data_free(image_comp->data);
-                }
+                opj_image_comp_release_data(&(image->comps[compno]));
             }
             opj_free(image->comps);
         }
@@ -177,10 +220,7 @@ void opj_copy_image_header(const opj_image_t* p_image_src,
 
     if (p_image_dest->comps) {
         for (compno = 0; compno < p_image_dest->numcomps; compno++) {
-            opj_image_comp_t *image_comp = &(p_image_dest->comps[compno]);
-            if (image_comp->data) {
-                opj_image_data_free(image_comp->data);
-            }
+            opj_image_comp_release_data(&(p_image_dest->comps[compno]));
         }
         opj_free(p_image_dest->comps);
         p_image_dest->comps = NULL;
@@ -201,6 +241,7 @@ void opj_copy_image_header(const opj_image_t* p_image_src,
                &(p_image_src->comps[compno]),
                sizeof(opj_image_comp_t));
         p_image_dest->comps[compno].data = NULL;
+        p_image_dest->comps[compno].data_is_external = OPJ_FALSE;
     }
 
     p_image_dest->color_space = p_image_src->color_space;

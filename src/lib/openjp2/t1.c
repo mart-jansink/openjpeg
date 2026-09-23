@@ -14,6 +14,7 @@
  * Copyright (c) 2007, Callum Lerwick <seg@haxxed.com>
  * Copyright (c) 2012, Carl Hetherington
  * Copyright (c) 2017, IntoPIX SA <support@intopix.com>
+ * Copyright (c) 2026, CtrlMovie AG
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -56,6 +57,10 @@
 #endif
 
 #include "t1_luts.h"
+
+#ifdef OPJ_USE_METAL
+#include "opj_metal_t1.h"
+#endif
 
 /** @defgroup T1 T1 - Implementation of the tier-1 coding */
 /*@{*/
@@ -198,7 +203,8 @@ static double opj_t1_encode_cblk(opj_t1_t *t1,
                                  OPJ_UINT32 cblksty,
                                  OPJ_UINT32 numcomps,
                                  const OPJ_FLOAT64 * mct_norms,
-                                 OPJ_UINT32 mct_numcomps);
+                                 OPJ_UINT32 mct_numcomps,
+                                 OPJ_INT32 * dump_nmsedec);
 
 /**
 Decode 1 code-block
@@ -2184,6 +2190,130 @@ static OPJ_BOOL opj_t1_decode_cblk(opj_t1_t *t1,
 }
 
 
+/* ----------------------------------------------------------------------- */
+/* T1 encoder dump hook (test oracle for alternative T1 implementations).  */
+/*                                                                         */
+/* When the environment variable OPJ_T1_DUMP names a file, every code-     */
+/* block encoded by opj_t1_encode_cblk() is appended to that file. When    */
+/* the variable is unset the only cost is one cached flag test per tile    */
+/* and one NULL pointer test per pass.                                     */
+/*                                                                         */
+/* Binary format, all integers little-endian (host order on the supported  */
+/* platforms):                                                             */
+/*   File header (written only when the file is empty):                    */
+/*     char[8]  magic "OPJT1DMP"                                           */
+/*     uint32   version (1)                                                */
+/*     uint32   reserved (0)                                               */
+/*   Then any number of code-block records:                                */
+/*     uint32   tag 0x4B4C4243 ("CBLK" as bytes)                           */
+/*     uint32   record_size: bytes following this field                    */
+/*     uint32   w, h            code-block size                            */
+/*     uint32   orient          band->bandno (0 LL, 1 HL, 2 LH, 3 HH)      */
+/*     uint32   qmfbid          1 = 5/3 reversible, 0 = 9/7                */
+/*     uint32   cblksty                                                    */
+/*     uint32   band_numbps     band->numbps                               */
+/*     uint32   compno                                                     */
+/*     uint32   level           numresolutions - 1 - resno                 */
+/*     uint32   numbps          cblk->numbps (output)                      */
+/*     uint32   totalpasses     cblk->totalpasses (output)                 */
+/*     uint32   nbytes          rate of the last pass (0 if no pass)       */
+/*     float64  cpu_seconds     opj_clock() delta around                   */
+/*                              opj_t1_encode_cblk(); opj_clock() is       */
+/*                              process CPU time, so dump single-threaded  */
+/*     int32    data[w*h]       T1 input in raster order (row-major),      */
+/*                              two's complement, already scaled by        */
+/*                              1 << T1_NMSEDEC_FRACBITS (before the       */
+/*                              in-place sign-magnitude conversion)        */
+/*     totalpasses times:                                                  */
+/*       uint32 rate, uint32 len, uint32 term, int32 nmsedec               */
+/*     uint8    bytes[nbytes]   cblk->data[0 .. nbytes-1]                  */
+/* ----------------------------------------------------------------------- */
+
+#define OPJ_T1_DUMP_TAG 0x4B4C4243U
+#define OPJ_T1_DUMP_MAXPASSES 100
+
+static int opj_t1_dump_state = -1; /* -1 unknown, 0 disabled, 1 enabled */
+static FILE* opj_t1_dump_fp = NULL;
+static opj_mutex_t* opj_t1_dump_mutex = NULL;
+
+/* Called from opj_t1_encode_cblks(), i.e. outside of the T1 jobs */
+static void opj_t1_dump_init(void)
+{
+    const char* path;
+    if (opj_t1_dump_state >= 0) {
+        return;
+    }
+    opj_t1_dump_state = 0;
+    path = getenv("OPJ_T1_DUMP");
+    if (path == NULL || path[0] == '\0') {
+        return;
+    }
+    opj_t1_dump_fp = fopen(path, "ab");
+    if (opj_t1_dump_fp == NULL) {
+        fprintf(stderr, "OPJ_T1_DUMP: cannot open %s\n", path);
+        return;
+    }
+    opj_t1_dump_mutex = opj_mutex_create();
+    if (fseek(opj_t1_dump_fp, 0, SEEK_END) == 0 &&
+            ftell(opj_t1_dump_fp) == 0) {
+        const OPJ_UINT32 hdr[2] = { 1U, 0U };
+        fwrite("OPJT1DMP", 1, 8, opj_t1_dump_fp);
+        fwrite(hdr, sizeof(OPJ_UINT32), 2, opj_t1_dump_fp);
+    }
+    opj_t1_dump_state = 1;
+}
+
+/* data: T1 input in raster order. Called from the T1 jobs */
+static void opj_t1_dump_write(const opj_tcd_cblk_enc_t* cblk,
+                              const OPJ_INT32* data,
+                              OPJ_UINT32 w, OPJ_UINT32 h,
+                              OPJ_UINT32 orient, OPJ_UINT32 qmfbid,
+                              OPJ_UINT32 cblksty, OPJ_UINT32 band_numbps,
+                              OPJ_UINT32 compno, OPJ_UINT32 level,
+                              OPJ_FLOAT64 cpu_seconds,
+                              const OPJ_INT32* nmsedec)
+{
+    OPJ_UINT32 hdr[13];
+    OPJ_UINT32 passno;
+    const OPJ_UINT32 npasses = cblk->totalpasses;
+    const OPJ_UINT32 nbytes = npasses ? cblk->passes[npasses - 1].rate : 0U;
+
+    hdr[0] = OPJ_T1_DUMP_TAG;
+    hdr[1] = 11U * 4U + 8U + w * h * 4U + npasses * 16U + nbytes;
+    hdr[2] = w;
+    hdr[3] = h;
+    hdr[4] = orient;
+    hdr[5] = qmfbid;
+    hdr[6] = cblksty;
+    hdr[7] = band_numbps;
+    hdr[8] = compno;
+    hdr[9] = level;
+    hdr[10] = cblk->numbps;
+    hdr[11] = npasses;
+    hdr[12] = nbytes;
+
+    if (opj_t1_dump_mutex) {
+        opj_mutex_lock(opj_t1_dump_mutex);
+    }
+    fwrite(hdr, sizeof(OPJ_UINT32), 13, opj_t1_dump_fp);
+    fwrite(&cpu_seconds, sizeof(OPJ_FLOAT64), 1, opj_t1_dump_fp);
+    fwrite(data, sizeof(OPJ_INT32), (size_t)w * h, opj_t1_dump_fp);
+    for (passno = 0; passno < npasses; ++passno) {
+        OPJ_UINT32 p[4];
+        p[0] = cblk->passes[passno].rate;
+        p[1] = cblk->passes[passno].len;
+        p[2] = cblk->passes[passno].term;
+        memcpy(&p[3], &nmsedec[passno], sizeof(OPJ_INT32));
+        fwrite(p, sizeof(OPJ_UINT32), 4, opj_t1_dump_fp);
+    }
+    if (nbytes) {
+        fwrite(cblk->data, 1, nbytes, opj_t1_dump_fp);
+    }
+    if (opj_t1_dump_mutex) {
+        opj_mutex_unlock(opj_t1_dump_mutex);
+    }
+}
+
 typedef struct {
     OPJ_UINT32 compno;
     OPJ_UINT32 resno;
@@ -2423,7 +2553,38 @@ static void opj_t1_cblk_encode_processor(void* user_data, opj_tls_t* tls)
     }
 
     {
-        OPJ_FLOAT64 cumwmsedec =
+        OPJ_FLOAT64 cumwmsedec;
+        OPJ_INT32* dump_data = NULL;
+        OPJ_INT32 dump_nmsedec[OPJ_T1_DUMP_MAXPASSES];
+        OPJ_FLOAT64 dump_t0 = 0.0;
+
+        if (opj_t1_dump_state == 1) {
+            /* Convert the zigzag (stripe) order back to raster order */
+            dump_data = (OPJ_INT32*) opj_malloc((size_t)cblk_w * cblk_h *
+                                                sizeof(OPJ_INT32));
+            if (dump_data) {
+                const OPJ_INT32* src = t1->data;
+                for (j = 0; j < (cblk_h & ~3U); j += 4) {
+                    for (i = 0; i < cblk_w; ++i) {
+                        OPJ_UINT32 k;
+                        for (k = 0; k < 4; ++k) {
+                            dump_data[(j + k) * cblk_w + i] = *src++;
+                        }
+                    }
+                }
+                if (j < cblk_h) {
+                    for (i = 0; i < cblk_w; ++i) {
+                        OPJ_UINT32 k;
+                        for (k = j; k < cblk_h; ++k) {
+                            dump_data[k * cblk_w + i] = *src++;
+                        }
+                    }
+                }
+            }
+            dump_t0 = opj_clock();
+        }
+
+        cumwmsedec =
             opj_t1_encode_cblk(
                 t1,
                 cblk,
@@ -2435,7 +2596,17 @@ static void opj_t1_cblk_encode_processor(void* user_data, opj_tls_t* tls)
                 tccp->cblksty,
                 job->tile->numcomps,
                 job->mct_norms,
-                job->mct_numcomps);
+                job->mct_numcomps,
+                dump_data ? dump_nmsedec : NULL);
+
+        if (dump_data) {
+            OPJ_FLOAT64 dump_dt = opj_clock() - dump_t0;
+            opj_t1_dump_write(cblk, dump_data, cblk_w, cblk_h, band->bandno,
+                              tccp->qmfbid, tccp->cblksty, (OPJ_UINT32)band->numbps,
+                              job->compno, tilec->numresolutions - 1 - resno,
+                              dump_dt, dump_nmsedec);
+            opj_free(dump_data);
+        }
         if (job->mutex) {
             opj_mutex_lock(job->mutex);
         }
@@ -2449,6 +2620,384 @@ static void opj_t1_cblk_encode_processor(void* user_data, opj_tls_t* tls)
 }
 
 
+static OPJ_BOOL opj_t1_submit_encode_job(opj_thread_pool_t* tp,
+        opj_tcd_tile_t *tile, OPJ_UINT32 compno, OPJ_UINT32 resno,
+        opj_tcd_cblk_enc_t* cblk, opj_tcd_band_t* band,
+        opj_tcd_tilecomp_t* tilec, opj_tccp_t* tccp,
+        const OPJ_FLOAT64 * mct_norms, OPJ_UINT32 mct_numcomps,
+        volatile OPJ_BOOL* pret, opj_mutex_t* mutex)
+{
+    opj_t1_cblk_encode_processing_job_t* job =
+        (opj_t1_cblk_encode_processing_job_t*) opj_calloc(1,
+                sizeof(opj_t1_cblk_encode_processing_job_t));
+    if (!job) {
+        return OPJ_FALSE;
+    }
+    job->compno = compno;
+    job->tile = tile;
+    job->resno = resno;
+    job->cblk = cblk;
+    job->band = band;
+    job->tilec = tilec;
+    job->tccp = tccp;
+    job->mct_norms = mct_norms;
+    job->mct_numcomps = mct_numcomps;
+    job->pret = pret;
+    job->mutex = mutex;
+    opj_thread_pool_submit_job(tp, opj_t1_cblk_encode_processor, job);
+    return OPJ_TRUE;
+}
+
+#ifdef OPJ_USE_METAL
+/* ----------------------------------------------------------------------- */
+/* GPU (Metal) T1 path, see metal/opj_metal_t1.h.                          */
+/* ----------------------------------------------------------------------- */
+
+typedef struct {
+    opj_tcd_cblk_enc_t* cblk;
+    opj_tcd_band_t* band;
+    opj_tcd_tilecomp_t* tilec;
+    opj_tccp_t* tccp;
+    OPJ_UINT32 compno;
+    OPJ_UINT32 resno;
+    OPJ_UINT32 gpu; /* index in the GPU batch, or (OPJ_UINT32)-1 */
+} opj_t1_cblk_ref_t;
+
+typedef struct {
+    const opj_t1_cblk_ref_t* refs;
+    OPJ_INT32** ptrs;
+    OPJ_UINT32 begin, end;
+} opj_t1_quant_job_t;
+
+/* Same quantisation as opj_t1_cblk_encode_processor(), but in raster order
+ * into dst (w * h samples). */
+static void opj_t1_quantise_raster(const opj_t1_cblk_ref_t* r, OPJ_INT32* dst)
+{
+    const opj_tcd_cblk_enc_t* cblk = r->cblk;
+    const opj_tcd_band_t* band = r->band;
+    const opj_tcd_tilecomp_t* tilec = r->tilec;
+    const OPJ_UINT32 tile_w = (OPJ_UINT32)(tilec->x1 - tilec->x0);
+    const OPJ_UINT32 cblk_w = (OPJ_UINT32)(cblk->x1 - cblk->x0);
+    const OPJ_UINT32 cblk_h = (OPJ_UINT32)(cblk->y1 - cblk->y0);
+    OPJ_INT32 x = cblk->x0 - band->x0;
+    OPJ_INT32 y = cblk->y0 - band->y0;
+    OPJ_UINT32 i, j;
+    const OPJ_INT32* tiledp;
+
+    if (band->bandno & 1) {
+        opj_tcd_resolution_t *pres = &tilec->resolutions[r->resno - 1];
+        x += pres->x1 - pres->x0;
+    }
+    if (band->bandno & 2) {
+        opj_tcd_resolution_t *pres = &tilec->resolutions[r->resno - 1];
+        y += pres->y1 - pres->y0;
+    }
+    tiledp = &tilec->data[(OPJ_SIZE_T)y * tile_w + (OPJ_SIZE_T)x];
+
+    if (r->tccp->qmfbid == 1) {
+        const OPJ_UINT32* OPJ_RESTRICT tiledp_u = (const OPJ_UINT32*) tiledp;
+        OPJ_UINT32* OPJ_RESTRICT d = (OPJ_UINT32*) dst;
+        for (j = 0; j < cblk_h; ++j) {
+            for (i = 0; i < cblk_w; ++i) {
+                d[j * cblk_w + i] = tiledp_u[j * tile_w + i] << T1_NMSEDEC_FRACBITS;
+            }
+        }
+    } else {
+        const OPJ_FLOAT32* OPJ_RESTRICT tiledp_f = (const OPJ_FLOAT32*) tiledp;
+        for (j = 0; j < cblk_h; ++j) {
+            for (i = 0; i < cblk_w; ++i) {
+                dst[j * cblk_w + i] = (OPJ_INT32)opj_lrintf((tiledp_f[j * tile_w + i] /
+                                      band->stepsize) * (1 << T1_NMSEDEC_FRACBITS));
+            }
+        }
+    }
+}
+
+static void opj_t1_quant_job_fn(void* user_data, opj_tls_t* tls)
+{
+    const opj_t1_quant_job_t* job = (const opj_t1_quant_job_t*)user_data;
+    OPJ_UINT32 i;
+    (void)tls;
+    for (i = job->begin; i < job->end; ++i) {
+        const opj_t1_cblk_ref_t* r = &job->refs[i];
+        if (r->gpu != (OPJ_UINT32) - 1) {
+            opj_t1_quantise_raster(r, job->ptrs[r->gpu]);
+        }
+    }
+}
+
+/* Encodes the code-blocks of the tile on the GPU, submitting CPU jobs for
+ * the ones it cannot take. Returns OPJ_FALSE, without having modified
+ * anything, when the whole tile must go through the CPU path instead. */
+static OPJ_BOOL opj_t1_encode_cblks_metal(opj_tcd_t* tcd,
+        opj_tcd_tile_t *tile,
+        opj_tcp_t *tcp,
+        const OPJ_FLOAT64 * mct_norms,
+        OPJ_UINT32 mct_numcomps,
+        volatile OPJ_BOOL* pret,
+        opj_mutex_t* mutex)
+{
+    opj_thread_pool_t* tp = tcd->thread_pool;
+    OPJ_UINT32 compno, resno, bandno, precno, cblkno;
+    OPJ_UINT32 ntotal = 0, ngpu = 0, n, i;
+    opj_t1_cblk_ref_t* refs = NULL;
+    opj_metal_t1_cblk_in* in = NULL;
+    opj_metal_t1_cblk_out* out = NULL;
+    OPJ_INT32** ptrs = NULL;
+    opj_metal_t1_t* batch = NULL;
+    OPJ_BOOL gpu_ok = OPJ_FALSE, handled = OPJ_FALSE;
+    OPJ_FLOAT64 t0, t1, t2, t3;
+    /* Test hook: OPJ_METAL_T1_DEBUG_CPU_EVERY=N sends every N-th code-block */
+    /* to the CPU jobs, to exercise the mixed GPU/CPU path. */
+    static int debug_cpu_every = -1;
+    if (debug_cpu_every < 0) {
+        const char* env = getenv("OPJ_METAL_T1_DEBUG_CPU_EVERY");
+        debug_cpu_every = env ? atoi(env) : 0;
+        if (debug_cpu_every < 0) {
+            debug_cpu_every = 0;
+        }
+    }
+
+    t0 = opj_clock_wall();
+    tcd->prof_t1_quant = tcd->prof_t1_gpu = tcd->prof_t1_scatter = 0;
+    tcd->prof_t1_wait = 0;
+    tcd->prof_t1_gpu_cblks = tcd->prof_t1_cpu_cblks = 0;
+
+    /* Enumerate the code-blocks in the order of the CPU path */
+    for (n = 0; n < 2; ++n) {
+        OPJ_UINT32 k = 0;
+        for (compno = 0; compno < tile->numcomps; ++compno) {
+            opj_tcd_tilecomp_t* tilec = &tile->comps[compno];
+            opj_tccp_t* tccp = &tcp->tccps[compno];
+            for (resno = 0; resno < tilec->numresolutions; ++resno) {
+                opj_tcd_resolution_t *res = &tilec->resolutions[resno];
+                for (bandno = 0; bandno < res->numbands; ++bandno) {
+                    opj_tcd_band_t* band = &res->bands[bandno];
+                    if (opj_tcd_is_band_empty(band)) {
+                        continue;
+                    }
+                    for (precno = 0; precno < res->pw * res->ph; ++precno) {
+                        opj_tcd_precinct_t *prc = &band->precincts[precno];
+                        for (cblkno = 0; cblkno < prc->cw * prc->ch; ++cblkno) {
+                            opj_tcd_cblk_enc_t* cblk = &prc->cblks.enc[cblkno];
+                            if (n == 1) {
+                                const OPJ_INT32 w = cblk->x1 - cblk->x0;
+                                const OPJ_INT32 h = cblk->y1 - cblk->y0;
+                                opj_t1_cblk_ref_t* r = &refs[k];
+                                r->cblk = cblk;
+                                r->band = band;
+                                r->tilec = tilec;
+                                r->tccp = tccp;
+                                r->compno = compno;
+                                r->resno = resno;
+                                r->gpu = (OPJ_UINT32) - 1;
+                                if (tccp->cblksty == 0 && w > 0 && h > 0 &&
+                                        (debug_cpu_every == 0 ||
+                                         (k % (OPJ_UINT32)debug_cpu_every) != 0) &&
+                                        w <= OPJ_METAL_T1_MAX_SIDE &&
+                                        h <= OPJ_METAL_T1_MAX_SIDE &&
+                                        w * h <= OPJ_METAL_T1_MAX_AREA &&
+                                        cblk->data != NULL &&
+                                        cblk->data_size >= 74U + (OPJ_UINT32)(w * h) * 4U) {
+                                    opj_metal_t1_cblk_in* c = &in[ngpu];
+                                    c->data = NULL;
+                                    c->w = (OPJ_UINT32)w;
+                                    c->h = (OPJ_UINT32)h;
+                                    c->orient = band->bandno;
+                                    c->qmfbid = tccp->qmfbid;
+                                    c->cblksty = 0;
+                                    c->band_numbps = (OPJ_UINT32)band->numbps;
+                                    r->gpu = ngpu++;
+                                }
+                            }
+                            k++;
+                        }
+                    }
+                }
+            }
+        }
+        if (n == 0) {
+            ntotal = k;
+            if (ntotal == 0) {
+                return OPJ_FALSE;
+            }
+            refs = (opj_t1_cblk_ref_t*)opj_malloc(ntotal * sizeof(*refs));
+            in = (opj_metal_t1_cblk_in*)opj_malloc(ntotal * sizeof(*in));
+            if (!refs || !in) {
+                goto cleanup;
+            }
+        }
+    }
+    if (ngpu == 0) {
+        goto cleanup;
+    }
+    out = (opj_metal_t1_cblk_out*)opj_malloc(ngpu * sizeof(*out));
+    ptrs = (OPJ_INT32**)opj_malloc(ngpu * sizeof(*ptrs));
+    if (!out || !ptrs) {
+        goto cleanup;
+    }
+    {
+        const OPJ_FLOAT64 tw = opj_clock_wall();
+        batch = opj_metal_t1_acquire();
+        tcd->prof_t1_wait = opj_clock_wall() - tw;
+    }
+    if (!batch) {
+        goto cleanup;
+    }
+    if (!opj_metal_t1_prepare(batch, in, ngpu, ptrs)) {
+        goto cleanup;
+    }
+
+    /* Quantise straight into the GPU input buffer */
+    {
+        int nthreads = opj_thread_pool_get_thread_count(tp);
+        if (nthreads > 1) {
+            OPJ_UINT32 njobs = (OPJ_UINT32)nthreads * 4U, chunk;
+            opj_t1_quant_job_t* jobs;
+            if (njobs > ntotal) {
+                njobs = ntotal;
+            }
+            chunk = (ntotal + njobs - 1) / njobs;
+            jobs = (opj_t1_quant_job_t*)opj_malloc(njobs * sizeof(*jobs));
+            if (!jobs) {
+                goto cleanup;
+            }
+            for (i = 0; i < njobs; ++i) {
+                jobs[i].refs = refs;
+                jobs[i].ptrs = ptrs;
+                jobs[i].begin = i * chunk;
+                jobs[i].end = opj_uint_min((i + 1) * chunk, ntotal);
+                opj_thread_pool_submit_job(tp, opj_t1_quant_job_fn, &jobs[i]);
+            }
+            opj_thread_pool_wait_completion(tp, 0);
+            opj_free(jobs);
+        } else {
+            opj_t1_quant_job_t job;
+            job.refs = refs;
+            job.ptrs = ptrs;
+            job.begin = 0;
+            job.end = ntotal;
+            opj_t1_quant_job_fn(&job, NULL);
+        }
+    }
+    t1 = opj_clock_wall();
+
+    /* From here on the tile is handled here: the code-blocks the GPU does */
+    /* not take go to the CPU jobs (which may run in parallel on the pool) */
+    handled = OPJ_TRUE;
+    for (i = 0; i < ntotal; ++i) {
+        const opj_t1_cblk_ref_t* r = &refs[i];
+        if (r->gpu == (OPJ_UINT32) - 1) {
+            tcd->prof_t1_cpu_cblks++;
+            if (!opj_t1_submit_encode_job(tp, tile, r->compno, r->resno, r->cblk,
+                                          r->band, r->tilec, r->tccp, mct_norms,
+                                          mct_numcomps, pret, mutex)) {
+                *pret = OPJ_FALSE;
+                goto cleanup;
+            }
+        }
+    }
+
+    gpu_ok = opj_metal_t1_run(batch, out);
+    t2 = opj_clock_wall();
+
+    if (!gpu_ok) {
+        /* Nothing has been written to the code-blocks yet: encode all of */
+        /* them on the CPU. */
+        for (i = 0; i < ntotal; ++i) {
+            const opj_t1_cblk_ref_t* r = &refs[i];
+            if (r->gpu != (OPJ_UINT32) - 1) {
+                tcd->prof_t1_cpu_cblks++;
+                if (!opj_t1_submit_encode_job(tp, tile, r->compno, r->resno,
+                                              r->cblk, r->band, r->tilec,
+                                              r->tccp, mct_norms, mct_numcomps,
+                                              pret, mutex)) {
+                    *pret = OPJ_FALSE;
+                    goto cleanup;
+                }
+            }
+        }
+        t3 = t2;
+    } else {
+        /* Scatter the results, with the distortion bookkeeping of */
+        /* opj_t1_encode_cblk() */
+        OPJ_FLOAT64 distotile = 0;
+        tcd->prof_t1_gpu_cblks = ngpu;
+        /* code-blocks the GPU gave up on go to the CPU jobs */
+        for (i = 0; i < ntotal; ++i) {
+            const opj_t1_cblk_ref_t* r = &refs[i];
+            if (r->gpu != (OPJ_UINT32) - 1 && out[r->gpu].status != 0) {
+                tcd->prof_t1_gpu_cblks--;
+                tcd->prof_t1_cpu_cblks++;
+                if (!opj_t1_submit_encode_job(tp, tile, r->compno, r->resno,
+                                              r->cblk, r->band, r->tilec,
+                                              r->tccp, mct_norms, mct_numcomps,
+                                              pret, mutex)) {
+                    *pret = OPJ_FALSE;
+                    goto cleanup;
+                }
+            }
+        }
+        for (i = 0; i < ntotal; ++i) {
+            const opj_t1_cblk_ref_t* r = &refs[i];
+            const opj_metal_t1_cblk_out* o;
+            opj_tcd_cblk_enc_t* cblk = r->cblk;
+            OPJ_FLOAT64 cumwmsedec = 0.0;
+            OPJ_UINT32 passno;
+            OPJ_UINT32 level;
+            if (r->gpu == (OPJ_UINT32) - 1 || out[r->gpu].status != 0) {
+                continue;
+            }
+            o = &out[r->gpu];
+            level = r->tilec->numresolutions - 1 - r->resno;
+            cblk->numbps = o->numbps;
+            cblk->totalpasses = o->totalpasses;
+            if (o->nbytes) {
+                memcpy(cblk->data, o->data, o->nbytes);
+            }
+            for (passno = 0; passno < o->totalpasses; ++passno) {
+                opj_tcd_pass_t *pass = &cblk->passes[passno];
+                const opj_metal_t1_pass* gp = &o->passes[passno];
+                const OPJ_INT32 bpno = (OPJ_INT32)o->numbps - 1 -
+                                       (OPJ_INT32)((passno + 2) / 3);
+                cumwmsedec += opj_t1_getwmsedec(gp->nmsedec, r->compno, level,
+                                                r->band->bandno, bpno,
+                                                r->tccp->qmfbid,
+                                                r->band->stepsize,
+                                                tile->numcomps, mct_norms,
+                                                mct_numcomps);
+                pass->distortiondec = cumwmsedec;
+                pass->rate = gp->rate;
+                pass->len = gp->len;
+                pass->term = (passno + 1 == o->totalpasses) ? 1 : 0;
+            }
+            distotile += cumwmsedec;
+        }
+        if (mutex) {
+            opj_mutex_lock(mutex);
+        }
+        tile->distotile += distotile;
+        if (mutex) {
+            opj_mutex_unlock(mutex);
+        }
+        t3 = opj_clock_wall();
+    }
+    tcd->prof_t1_quant = t1 - t0 - tcd->prof_t1_wait;
+    tcd->prof_t1_gpu = t2 - t1;
+    tcd->prof_t1_scatter = t3 - t2;
+
+cleanup:
+    if (batch) {
+        opj_metal_t1_release(batch);
+    }
+    opj_free(refs);
+    opj_free(in);
+    opj_free(out);
+    opj_free(ptrs);
+    return handled;
+}
+#endif /* OPJ_USE_METAL */
+
 OPJ_BOOL opj_t1_encode_cblks(opj_tcd_t* tcd,
                              opj_tcd_tile_t *tile,
                              opj_tcp_t *tcp,
@@ -2461,7 +3010,18 @@ OPJ_BOOL opj_t1_encode_cblks(opj_tcd_t* tcd,
     OPJ_UINT32 compno, resno, bandno, precno, cblkno;
     opj_mutex_t* mutex = opj_mutex_create();
 
+    opj_t1_dump_init();
+
     tile->distotile = 0;
+
+#ifdef OPJ_USE_METAL
+    /* The dump hook records the CPU encoder, so it disables the GPU path */
+    if (tcd->metal_t1 && opj_t1_dump_state != 1 &&
+            opj_t1_encode_cblks_metal(tcd, tile, tcp, mct_norms, mct_numcomps,
+                                      &ret, mutex)) {
+        goto end;
+    }
+#endif
 
     for (compno = 0; compno < tile->numcomps; ++compno) {
         opj_tcd_tilecomp_t* tilec = &tile->comps[compno];
@@ -2483,26 +3043,12 @@ OPJ_BOOL opj_t1_encode_cblks(opj_tcd_t* tcd,
                     for (cblkno = 0; cblkno < prc->cw * prc->ch; ++cblkno) {
                         opj_tcd_cblk_enc_t* cblk = &prc->cblks.enc[cblkno];
 
-                        opj_t1_cblk_encode_processing_job_t* job =
-                            (opj_t1_cblk_encode_processing_job_t*) opj_calloc(1,
-                                    sizeof(opj_t1_cblk_encode_processing_job_t));
-                        if (!job) {
+                        if (!opj_t1_submit_encode_job(tp, tile, compno, resno, cblk,
+                                                      band, tilec, tccp, mct_norms,
+                                                      mct_numcomps, &ret, mutex)) {
                             ret = OPJ_FALSE;
                             goto end;
                         }
-                        job->compno = compno;
-                        job->tile = tile;
-                        job->resno = resno;
-                        job->cblk = cblk;
-                        job->band = band;
-                        job->tilec = tilec;
-                        job->tccp = tccp;
-                        job->mct_norms = mct_norms;
-                        job->mct_numcomps = mct_numcomps;
-                        job->pret = &ret;
-                        job->mutex = mutex;
-                        opj_thread_pool_submit_job(tp, opj_t1_cblk_encode_processor, job);
-
                     } /* cblkno */
                 } /* precno */
             } /* bandno */
@@ -2513,6 +3059,9 @@ end:
     opj_thread_pool_wait_completion(tcd->thread_pool, 0);
     if (mutex) {
         opj_mutex_destroy(mutex);
+    }
+    if (opj_t1_dump_state == 1) {
+        fflush(opj_t1_dump_fp);
     }
 
     return ret;
@@ -2559,7 +3108,8 @@ static OPJ_FLOAT64 opj_t1_encode_cblk(opj_t1_t *t1,
                                       OPJ_UINT32 cblksty,
                                       OPJ_UINT32 numcomps,
                                       const OPJ_FLOAT64 * mct_norms,
-                                      OPJ_UINT32 mct_numcomps)
+                                      OPJ_UINT32 mct_numcomps,
+                                      OPJ_INT32 * dump_nmsedec)
 {
     OPJ_FLOAT64 cumwmsedec = 0.0;
 
@@ -2650,6 +3200,10 @@ static OPJ_FLOAT64 opj_t1_encode_cblk(opj_t1_t *t1,
                 opj_mqc_segmark_enc(mqc);
             }
             break;
+        }
+
+        if (dump_nmsedec) {
+            dump_nmsedec[passno] = nmsedec;
         }
 
         tempwmsedec = opj_t1_getwmsedec(nmsedec, compno, level, orient, bpno, qmfbid,

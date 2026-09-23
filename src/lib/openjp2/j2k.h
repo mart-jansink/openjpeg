@@ -16,6 +16,7 @@
  * Copyright (c) 2011-2012, Centre National d'Etudes Spatiales (CNES), France
  * Copyright (c) 2012, CS Systemes d'Information, France
  *
+ * Copyright (c) 2026, CtrlMovie AG
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -283,6 +284,10 @@ typedef struct opj_tcp {
     OPJ_INT32  m_current_tile_part_number;
     /** number of tile parts for the tile. */
     OPJ_UINT32 m_nb_tile_parts;
+    /** Encoder: exact upper bound of the packet bytes (all layers) of this
+     * tile so that the codestream stays within m_max_cs_size, 0 if there is
+     * no such limit. Set by opj_j2k_update_rates(). CtrlMovie fork. */
+    OPJ_UINT32 m_max_packet_bytes;
     /** data for the tile */
     OPJ_BYTE *      m_data;
     /** size of data */
@@ -330,6 +335,10 @@ typedef enum {
 typedef struct opj_encoding_param {
     /** Maximum rate for each component. If == 0, component size limitation is not considered */
     OPJ_UINT32 m_max_comp_size;
+    /** Maximum codestream size in bytes when it is an explicit limit (given
+     * by the caller or by the Cinema/IMF profile), 0 otherwise. Enforced
+     * exactly through opj_tcp_t::m_max_packet_bytes. CtrlMovie fork. */
+    OPJ_UINT32 m_max_cs_size;
     /** Position of tile part flag in progression order*/
     OPJ_INT32 m_tp_pos;
     /** fixed layer */
@@ -591,6 +600,14 @@ typedef struct opj_j2k_enc {
 
     /** Number of components */
     OPJ_UINT32 m_nb_comps;
+
+    /** INPUT_MCT_DOMAIN=YES: the input planes are already DC level shifted
+     * and MCT transformed, so the encoder skips both stages. */
+    OPJ_BOOL   m_input_mct_domain;
+
+    /** METAL_T1 option: 0 not set (OPJ_METAL_T1 environment variable
+     * decides), 1 NO, 2 YES. */
+    OPJ_UINT32 m_metal_t1;
 
 } opj_j2k_enc_t;
 

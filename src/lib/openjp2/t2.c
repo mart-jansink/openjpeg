@@ -14,6 +14,7 @@
  * Copyright (c) 2008, 2011-2012, Centre National d'Etudes Spatiales (CNES), FR
  * Copyright (c) 2012, CS Systemes d'Information, France
  * Copyright (c) 2017, IntoPIX SA <support@intopix.com>
+ * Copyright (c) 2026, CtrlMovie AG
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -216,6 +217,53 @@ static OPJ_UINT32 opj_t2_getnumpasses(opj_bio_t *bio)
 
 /* ----------------------------------------------------------------------- */
 
+/* Number of tile-parts of progression pino of the tile that carry component
+ * compno, following the tile-part splitting of opj_j2k_get_num_tp() and
+ * opj_j2k_write_all_tile_parts(): when the split position (m_tp_flag) is at
+ * or after 'C' in the progression order, every tile-part holds a single
+ * component, and component c < compE gets tpnum / compE of the tpnum
+ * tile-parts of that progression. Returns 0 when tile-parts are not split
+ * per component (then no tile-part belongs to one component). CtrlMovie
+ * fork, used for the Cinema per-component size limit. */
+static OPJ_UINT32 opj_t2_comp_tile_parts(const opj_cp_t* cp,
+        const opj_tcp_t* tcp, OPJ_UINT32 pino, OPJ_UINT32 compno)
+{
+    const opj_poc_t* poc;
+    const OPJ_CHAR* prog;
+    OPJ_UINT32 tpnum = 1, i;
+    OPJ_BOOL has_c = OPJ_FALSE;
+
+    if (cp->m_specific_param.m_enc.m_tp_on != 1 || pino > tcp->numpocs) {
+        return 0;
+    }
+    poc = &tcp->pocs[pino];
+    prog = opj_j2k_convert_progression_order(tcp->prg);
+    for (i = 0; i < 4; ++i) {
+        switch (prog[i]) {
+        case 'C':
+            tpnum *= poc->compE;
+            has_c = OPJ_TRUE;
+            break;
+        case 'R':
+            tpnum *= poc->resE;
+            break;
+        case 'P':
+            tpnum *= poc->prcE;
+            break;
+        case 'L':
+            tpnum *= poc->layE;
+            break;
+        }
+        if (cp->m_specific_param.m_enc.m_tp_flag == prog[i]) {
+            break;
+        }
+    }
+    if (!has_c || poc->compE == 0 || compno >= poc->compE) {
+        return 0;
+    }
+    return tpnum / poc->compE;
+}
+
 OPJ_BOOL opj_t2_encode_packets(opj_t2_t* p_t2,
                                OPJ_UINT32 p_tile_no,
                                opj_tcd_tile_t *p_tile,
@@ -257,6 +305,7 @@ OPJ_BOOL opj_t2_encode_packets(opj_t2_t* p_t2,
 
         for (compno = 0; compno < l_max_comp; ++compno) {
             OPJ_UINT32 l_comp_len = 0;
+            OPJ_UINT32 l_comp_tp = 0; /* tile-parts of this component so far */
             l_current_pi = l_pi;
 
             for (poc = 0; poc < pocno ; ++poc) {
@@ -272,15 +321,65 @@ OPJ_BOOL opj_t2_encode_packets(opj_t2_t* p_t2,
                 }
                 while (opj_pi_next(l_current_pi)) {
                     if (l_current_pi->layno < p_maxlayers) {
+                        opj_tcd_precinct_t* l_first_prc = NULL;
+                        OPJ_BOOL l_clean = OPJ_FALSE;
                         l_nb_bytes = 0;
 
-                        if (! opj_t2_encode_packet(p_tile_no, p_tile, l_tcp, l_current_pi,
-                                                   l_current_data, &l_nb_bytes,
-                                                   p_max_len, cstr_info,
-                                                   p_t2_mode,
-                                                   p_manager)) {
+                        if (p_tile->t2_pkt_cache && p_maxlayers == 1 && !cstr_info) {
+                            /* A layer-0 packet only depends on the layer pass */
+                            /* counts of its precinct: reuse its size when no  */
+                            /* code-block of the precinct changed since it was */
+                            /* last computed. It fits if and only if its size  */
+                            /* is at most the remaining length.                */
+                            opj_tcd_resolution_t* l_res =
+                                &p_tile->comps[l_current_pi->compno].resolutions[l_current_pi->resno];
+                            OPJ_UINT32 b;
+                            l_clean = OPJ_TRUE;
+                            for (b = 0; b < l_res->numbands; ++b) {
+                                opj_tcd_band_t* l_band = &l_res->bands[b];
+                                opj_tcd_precinct_t* l_prc;
+                                if (opj_tcd_is_band_empty(l_band) ||
+                                        l_current_pi->precno >= l_res->pw * l_res->ph) {
+                                    continue;
+                                }
+                                l_prc = &l_band->precincts[l_current_pi->precno];
+                                if (!l_first_prc) {
+                                    l_first_prc = l_prc;
+                                }
+                                if (l_prc->t2_dirty) {
+                                    l_clean = OPJ_FALSE;
+                                }
+                            }
+                            if (!l_first_prc || !l_first_prc->t2_pkt_valid) {
+                                l_clean = OPJ_FALSE;
+                            }
+                        }
+
+                        if (l_clean) {
+                            l_nb_bytes = l_first_prc->t2_pkt_size;
+                            if (l_nb_bytes > p_max_len) {
+                                opj_pi_destroy(l_pi, l_nb_pocs);
+                                return OPJ_FALSE;
+                            }
+                        } else if (! opj_t2_encode_packet(p_tile_no, p_tile, l_tcp, l_current_pi,
+                                                          l_current_data, &l_nb_bytes,
+                                                          p_max_len, cstr_info,
+                                                          p_t2_mode,
+                                                          p_manager)) {
                             opj_pi_destroy(l_pi, l_nb_pocs);
                             return OPJ_FALSE;
+                        } else if (l_first_prc) {
+                            opj_tcd_resolution_t* l_res =
+                                &p_tile->comps[l_current_pi->compno].resolutions[l_current_pi->resno];
+                            OPJ_UINT32 b;
+                            l_first_prc->t2_pkt_size = l_nb_bytes;
+                            l_first_prc->t2_pkt_valid = 1;
+                            for (b = 0; b < l_res->numbands; ++b) {
+                                opj_tcd_band_t* l_band = &l_res->bands[b];
+                                if (!opj_tcd_is_band_empty(l_band)) {
+                                    l_band->precincts[l_current_pi->precno].t2_dirty = 0;
+                                }
+                            }
                         }
 
                         l_comp_len += l_nb_bytes;
@@ -292,7 +391,13 @@ OPJ_BOOL opj_t2_encode_packets(opj_t2_t* p_t2,
                 }
 
                 if (l_cp->m_specific_param.m_enc.m_max_comp_size) {
-                    if (l_comp_len > l_cp->m_specific_param.m_enc.m_max_comp_size) {
+                    /* SMPTE 429-2 measures a component from its tile-parts, */
+                    /* so count the SOT marker segment (12 bytes) and the SOD */
+                    /* marker (2 bytes) of each tile-part of this component  */
+                    /* written for the progressions processed so far.        */
+                    l_comp_tp += opj_t2_comp_tile_parts(l_cp, l_tcp, poc, compno);
+                    if ((OPJ_UINT64)l_comp_len + (OPJ_UINT64)l_comp_tp * 14U >
+                            l_cp->m_specific_param.m_enc.m_max_comp_size) {
                         opj_pi_destroy(l_pi, l_nb_pocs);
                         return OPJ_FALSE;
                     }

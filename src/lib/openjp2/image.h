@@ -5,6 +5,7 @@
  * are granted under this license.
  *
  * Copyright (c) 2005, Herve Drolon, FreeImage Team
+ * Copyright (c) 2026, CtrlMovie AG
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -63,6 +64,22 @@ void opj_image_comp_header_update(opj_image_t * p_image,
 
 void opj_copy_image_header(const opj_image_t* p_image_src,
                            opj_image_t* p_image_dest);
+
+/**
+ * Releases the plane of an image component: frees it with
+ * opj_image_data_free() unless it is caller-owned (data_is_external), then
+ * sets data to NULL and clears data_is_external. Every place that drops a
+ * comps[].data pointer must use this instead of calling
+ * opj_image_data_free() directly.
+ */
+void opj_image_comp_release_data(opj_image_comp_t *comp);
+
+/**
+ * Moves the plane (and its ownership flag) from src to dest. The previous
+ * plane of dest is released with opj_image_comp_release_data(). src is left
+ * with data == NULL.
+ */
+void opj_image_comp_move_data(opj_image_comp_t *dest, opj_image_comp_t *src);
 
 /*@}*/
 

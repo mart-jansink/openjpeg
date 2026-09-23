@@ -1,3 +1,4 @@
+/* Copyright (c) 2026, CtrlMovie AG */
 /*
 * The copyright in this software is being made available under the 2-clauses
 * BSD License, included below. This software may be subject to other third
@@ -705,6 +706,17 @@ typedef struct opj_image_comp {
     OPJ_INT32 *data;
     /** alpha channel */
     OPJ_UINT16 alpha;
+    /**
+     * CtrlMovie fork extension (ABI change versus upstream OpenJPEG, which
+     * is acceptable because this fork is linked statically).
+     * OPJ_TRUE when data is owned by the caller and was registered with
+     * opj_image_set_external_data(): OpenJPEG then uses the plane in place
+     * but never frees it. OPJ_FALSE (the default of a zero-initialized
+     * structure) when data was allocated with opj_image_data_alloc() and is
+     * owned by OpenJPEG. Do not set this field directly; use
+     * opj_image_set_external_data().
+     */
+    OPJ_BOOL data_is_external;
 } opj_image_comp_t;
 
 /**
@@ -1161,6 +1173,51 @@ OPJ_API void* OPJ_CALLCONV opj_image_data_alloc(OPJ_SIZE_T size);
  * @since 2.2.0
 */
 OPJ_API void OPJ_CALLCONV opj_image_data_free(void* ptr);
+
+/**
+ * Make an image component use a caller-owned plane (zero-copy input).
+ *
+ * After this call image->comps[compno].data == data and the plane is owned
+ * by the caller: OpenJPEG reads it (and, for a single-tile encode, transforms
+ * it in place, exactly as it does with its own planes), but never frees it,
+ * neither in opj_image_destroy() nor at the end of compression nor anywhere
+ * else. The caller must keep the plane alive until opj_end_compress() has
+ * returned and may reuse or free it afterwards. Its contents are undefined
+ * after a single-tile encode (DC shift, MCT and DWT are done in place).
+ *
+ * If the component already holds data allocated by OpenJPEG (for example by
+ * opj_image_create()), that data is freed first. To avoid that allocation
+ * altogether, create the image with opj_image_tile_create(), which allocates
+ * no planes.
+ *
+ * Requirements on data:
+ * - at least comps[compno].w * comps[compno].h OPJ_INT32 samples, row after
+ *   row without padding (stride == w);
+ * - aligned on at least 16 bytes (page alignment, as for a shared MTLBuffer,
+ *   is fine). A misaligned pointer is rejected.
+ *
+ * Note: opj_start_compress() moves the planes from the image passed to it
+ * into the codec, so image->comps[].data is NULL after that call; register
+ * the planes again (on the same or a new image) for every frame.
+ *
+ * Passing data == NULL detaches the component (frees OpenJPEG-owned data,
+ * forgets external data) and leaves comps[compno].data NULL.
+ *
+ * This is a CtrlMovie fork extension, not part of upstream OpenJPEG.
+ *
+ * @param   image   image whose component is set
+ * @param   compno  component index, < image->numcomps
+ * @param   data    caller-owned plane, or NULL
+ *
+ * @return  OPJ_TRUE on success, OPJ_FALSE on invalid arguments (NULL image,
+ *          compno out of range, misaligned data, w*h overflow).
+ */
+OPJ_API OPJ_BOOL OPJ_CALLCONV opj_image_set_external_data(opj_image_t* image,
+        OPJ_UINT32 compno, OPJ_INT32* data);
+
+/** Feature-test macro: this library provides opj_image_set_external_data()
+ * (CtrlMovie fork). */
+#define OPJ_HAVE_EXTERNAL_INPUT_DATA 1
 
 /*
 ==========================================================
@@ -1628,6 +1685,56 @@ OPJ_API OPJ_BOOL OPJ_CALLCONV opj_setup_encoder(opj_codec_t *p_codec,
  * <li>GUARD_BITS=value. Number of guard bits in [0,7] range. Default value is 2.
  *     1 may be used sometimes (like in SMPTE DCP Bv2.1 Application Profile for 2K images).
  *     Since 2.5.0</li>
+ * <li>INPUT_MCT_DOMAIN=YES/NO. Defaults to NO. CtrlMovie fork extension.
+ *     If set to YES, the encoder skips its DC level shift and forward
+ *     multi-component transform stages, because the caller has already
+ *     applied them (for example in a GPU kernel) to the image planes. The
+ *     codestream is unchanged: COD still signals the MCT, and rate
+ *     allocation uses the same MCT norms, so the decoder applies the inverse
+ *     transform as usual. Data contract for image->comps[c].data:
+ *     <ul>
+ *     <li>Irreversible (9/7, qmfbid 0, e.g. the Cinema profiles): each
+ *         OPJ_INT32 slot holds the bit pattern of an OPJ_FLOAT32 equal to
+ *         what opj_tcd_dc_level_shift_encode() followed by
+ *         opj_mct_encode_real() would produce: first
+ *         s_c = (OPJ_FLOAT32)(sample_c - dc_shift_c) with
+ *         dc_shift_c = 1 << (prec_c - 1) for unsigned components and 0 for
+ *         signed ones, then, when tcp_mct == 1 with 3+ components, for the
+ *         first 3 components (in component order, r=s_0, g=s_1, b=s_2)
+ *         comp0 = 0.299f*r + 0.587f*g + 0.114f*b,
+ *         comp1 = -0.16875f*r - 0.331260f*g + 0.5f*b,
+ *         comp2 = 0.5f*r - 0.41869f*g - 0.08131f*b
+ *         (the Y/Cb/Cr-like ICT outputs, computed in float32). Any
+ *         further components are only DC shifted.
+ *         For a byte-identical codestream the float arithmetic must match the
+ *         CPU build bit for bit, including FMA contraction; otherwise the
+ *         output is still a valid codestream of equivalent quality. The
+ *         arm64 Release build (clang, -ffast-math) evaluates
+ *         comp0 = fma(0.114f, b, fma(0.299f, r, 0.587f*g)),
+ *         comp1 = fma(0.5f, b, fma(-0.16875f, r, -0.331260f*g)),
+ *         comp2 = fma(-0.08131f, b, fma(0.5f, r, -0.41869f*g));
+ *         this depends on the compiler and flags used for mct.c.</li>
+ *     <li>Reversible (5/3, qmfbid 1): plain OPJ_INT32 s_c = sample_c -
+ *         dc_shift_c, then, when tcp_mct == 1, the RCT on the first 3
+ *         components: comp0 = (r + 2*g + b) >> 2, comp1 = b - g,
+ *         comp2 = r - g.</li>
+ *     </ul>
+ *     Requirements, checked here and again when encoding: a single tile,
+ *     no custom MCT (opj_set_MCT / mct_data), the image planes used in place
+ *     (16-byte aligned, which opj_image_set_external_data() enforces), and
+ *     opj_encode() rather than opj_write_tile(). Must be called after
+ *     opj_setup_encoder().</li>
+ * <li>METAL_T1=YES/NO. CtrlMovie fork extension. Encodes the tier-1
+ *     code-blocks on the GPU (Apple Metal) when the library is built with
+ *     OPJ_USE_METAL; ignored with a warning otherwise. The codestream is
+ *     byte-identical to the CPU path. Code-blocks the GPU does not support
+ *     (code-block style other than 0) and GPU failures fall back to the CPU.
+ *     When the option is not given, the environment variable OPJ_METAL_T1=1
+ *     enables it. Several encoders in one process share the GPU context;
+ *     at most OPJ_METAL_T1_MAX_BATCHES (environment variable, default 3)
+ *     tiles are in flight on the GPU at once, further encoders wait. Each
+ *     in-flight 4K frame (about 24000 32x32 code-blocks) holds about
+ *     180 MB of shared GPU memory, kept for reuse.</li>
  * </ul>
  *
  * @param p_codec       Compressor handle

@@ -1,3 +1,4 @@
+/* Copyright (c) 2026, CtrlMovie AG */
 #ifndef OPJ_CONFIG_H_INCLUDED
 #define OPJ_CONFIG_H_INCLUDED
 
@@ -10,5 +11,12 @@
 #define OPJ_VERSION_MAJOR @OPENJPEG_VERSION_MAJOR@
 #define OPJ_VERSION_MINOR @OPENJPEG_VERSION_MINOR@
 #define OPJ_VERSION_BUILD @OPENJPEG_VERSION_BUILD@
+
+/*--------------------------------------------------------------------------*/
+/* CtrlMovie fork features                                                  */
+
+/* Defined when the library is built with the Metal GPU tier-1 encoder
+ * (OPJ_USE_METAL=ON), i.e. when the METAL_T1=YES encoder option is effective. */
+#cmakedefine OPJ_HAVE_METAL_T1
 
 #endif

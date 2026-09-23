@@ -5,6 +5,7 @@
  * are granted under this license.
  *
  * Copyright (c) 2005, Herve Drolon, FreeImage Team
+ * Copyright (c) 2026, CtrlMovie AG
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -49,6 +50,12 @@ Difference in successive opj_clock() calls tells you the elapsed time
 @return Returns time in seconds
 */
 OPJ_FLOAT64 opj_clock(void);
+
+/**
+Monotonic wall-clock time (CtrlMovie fork, used by the OPJ_ENC_PROFILE timers)
+@return Returns time in seconds
+*/
+OPJ_FLOAT64 opj_clock_wall(void);
 
 /* ----------------------------------------------------------------------- */
 /*@}*/

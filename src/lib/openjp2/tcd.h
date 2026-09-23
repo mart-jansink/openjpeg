@@ -14,6 +14,7 @@
  * Copyright (c) 2008, 2011-2012, Centre National d'Etudes Spatiales (CNES), FR
  * Copyright (c) 2012, CS Systemes d'Information, France
  * Copyright (c) 2017, IntoPIX SA <support@intopix.com>
+ * Copyright (c) 2026, CtrlMovie AG
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -157,6 +158,14 @@ typedef struct opj_tcd_precinct {
     OPJ_UINT32 block_size;          /* size taken by cblks (in bytes) */
     opj_tgt_tree_t *incltree;       /* inclusion tree */
     opj_tgt_tree_t *imsbtree;       /* IMSB tree */
+    /* Encoder, rate allocation (CtrlMovie fork): bytes of the layer-0 packet
+     * of this precinct index as computed by the last THRESH_CALC run (kept in
+     * the precinct of the first non-empty band of the resolution), whether it
+     * is known, and whether a code-block of this precinct changed its layer
+     * pass count since. See opj_t2_encode_packets(). */
+    OPJ_UINT32 t2_pkt_size;
+    OPJ_BYTE t2_pkt_valid;
+    OPJ_BYTE t2_dirty;
 } opj_tcd_precinct_t;
 
 /** Sub-band structure */
@@ -240,6 +249,9 @@ typedef struct opj_tcd_tile {
     OPJ_FLOAT64 distotile;          /* distortion of the tile */
     OPJ_FLOAT64 distolayer[100];    /* distortion per layer */
     OPJ_UINT32 packno;              /* packet number */
+    /* Encoder: THRESH_CALC may reuse the packet sizes of clean precincts
+     * (single layer, set by opj_tcd_rateallocate() only) */
+    OPJ_BOOL t2_pkt_cache;
 } opj_tcd_tile_t;
 
 /**
@@ -288,6 +300,28 @@ typedef struct opj_tcd {
     OPJ_BOOL   whole_tile_decoding;
     /* Array of size image->numcomps indicating if a component must be decoded. NULL if all components must be decoded */
     OPJ_BOOL* used_component;
+    /** Only valid for encoding. When OPJ_TRUE, the tile component data is
+     * already DC level shifted and MCT transformed (INPUT_MCT_DOMAIN=YES),
+     * so opj_tcd_encode_tile() skips those two stages. */
+    OPJ_BOOL   input_mct_domain;
+    /** Only valid for encoding. Encode the code-blocks on the GPU when the
+     * library is built with OPJ_USE_METAL (METAL_T1=YES or OPJ_METAL_T1=1). */
+    OPJ_BOOL   metal_t1;
+    /** OPJ_ENC_PROFILE timers of the last opj_t1_encode_cblks() Metal path,
+     * in seconds: quantisation, GPU batch (wait), scatter, CPU fallback. */
+    OPJ_FLOAT64 prof_t1_wait;  /* waiting for a free GPU batch */
+    OPJ_FLOAT64 prof_t1_quant;
+    OPJ_FLOAT64 prof_t1_gpu;
+    OPJ_FLOAT64 prof_t1_scatter;
+    OPJ_UINT32  prof_t1_gpu_cblks;
+    OPJ_UINT32  prof_t1_cpu_cblks;
+    /** OPJ_ENC_PROFILE counters of opj_tcd_rateallocate(): bisection
+     * iterations, THRESH_CALC tier-2 runs, code-blocks rescanned by
+     * opj_tcd_makelayer(), and seconds spent in the THRESH_CALC runs. */
+    OPJ_UINT32  prof_ra_iters;
+    OPJ_UINT32  prof_ra_t2;
+    OPJ_UINT32  prof_ra_rescans;
+    OPJ_FLOAT64 prof_ra_t2_s;
 } opj_tcd_t;
 
 /**

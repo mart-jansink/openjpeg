@@ -5,6 +5,7 @@
  * are granted under this license.
  *
  * Copyright (c) 2005, Herve Drolon, FreeImage Team
+ * Copyright (c) 2026, CtrlMovie AG
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -65,3 +66,13 @@ OPJ_FLOAT64 opj_clock(void)
 #endif
 }
 
+OPJ_FLOAT64 opj_clock_wall(void)
+{
+#ifdef _WIN32
+    return opj_clock();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (OPJ_FLOAT64)ts.tv_sec + (OPJ_FLOAT64)ts.tv_nsec * 1e-9;
+#endif
+}

@@ -14,6 +14,7 @@
  * Copyright (c) 2007, Jonathan Ballard <dzonatas@dzonux.net>
  * Copyright (c) 2007, Callum Lerwick <seg@haxxed.com>
  * Copyright (c) 2017, IntoPIX SA <support@intopix.com>
+ * Copyright (c) 2026, CtrlMovie AG
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -174,7 +175,8 @@ static OPJ_BOOL opj_dwt_encode_procedure(opj_thread_pool_t* tp,
         opj_tcd_tilecomp_t * tilec,
         opj_encode_and_deinterleave_v_fnptr_type p_encode_and_deinterleave_v,
         opj_encode_and_deinterleave_h_one_row_fnptr_type
-        p_encode_and_deinterleave_h_one_row);
+        p_encode_and_deinterleave_h_one_row,
+        OPJ_UINT32 v_cols);
 
 static OPJ_UINT32 opj_dwt_max_resolution(opj_tcd_resolution_t* OPJ_RESTRICT r,
         OPJ_UINT32 i);
@@ -233,19 +235,39 @@ static void opj_dwt_deinterleave_h(const OPJ_INT32 * OPJ_RESTRICT a,
                                    OPJ_INT32 dn,
                                    OPJ_INT32 sn, OPJ_INT32 cas)
 {
-    OPJ_INT32 i;
-    OPJ_INT32 * OPJ_RESTRICT l_dest = b;
-    const OPJ_INT32 * OPJ_RESTRICT l_src = a + cas;
+    OPJ_INT32 i = 0;
+    OPJ_INT32 * OPJ_RESTRICT l_dest;
+    const OPJ_INT32 * OPJ_RESTRICT l_src;
 
-    for (i = 0; i < sn; ++i) {
+#ifdef __ARM_NEON
+    {
+        /* both outputs of 4 sample pairs at a time */
+        const OPJ_INT32 n = opj_int_min(sn, dn);
+        OPJ_INT32* OPJ_RESTRICT b_even = cas ? b + sn : b;
+        OPJ_INT32* OPJ_RESTRICT b_odd = cas ? b : b + sn;
+        for (; i + 4 <= n; i += 4) {
+            const int32x4x2_t v = vld2q_s32(a + 2 * i);
+            vst1q_s32(b_even + i, v.val[0]);
+            vst1q_s32(b_odd + i, v.val[1]);
+        }
+    }
+#endif
+    l_dest = b + i;
+    l_src = a + cas + 2 * i;
+    for (; i < sn; ++i) {
         *l_dest++ = *l_src;
         l_src += 2;
     }
 
-    l_dest = b + sn;
-    l_src = a + 1 - cas;
+#ifdef __ARM_NEON
+    i = opj_int_min(sn, dn) & ~3;
+#else
+    i = 0;
+#endif
+    l_dest = b + sn + i;
+    l_src = a + 1 - cas + 2 * i;
 
-    for (i = 0; i < dn; ++i)  {
+    for (; i < dn; ++i)  {
         *l_dest++ = *l_src;
         l_src += 2;
     }
@@ -1206,6 +1228,11 @@ static void opj_dwt_encode_step1_combined(OPJ_FLOAT32* fw,
         const __m128 vcst = _mm_set_ps(c2, c1, c2, c1);
         *(__m128*)fw = _mm_mul_ps(*(__m128*)fw, vcst);
         *(__m128*)(fw + 4) = _mm_mul_ps(*(__m128*)(fw + 4), vcst);
+#elif defined(__ARM_NEON)
+        const float32x4_t vcst = vcombine_f32(vset_lane_f32(c2, vdup_n_f32(c1), 1),
+                                              vset_lane_f32(c2, vdup_n_f32(c1), 1));
+        vst1q_f32(fw, vmulq_f32(vld1q_f32(fw), vcst));
+        vst1q_f32(fw + 4, vmulq_f32(vld1q_f32(fw + 4), vcst));
 #else
         fw[0] *= c1;
         fw[1] *= c2;
@@ -1243,6 +1270,20 @@ static void opj_dwt_encode_step2(OPJ_FLOAT32* fl, OPJ_FLOAT32* fw,
         fw[-1] += (fl[0] + fw[0]) * c;
         fw += 2;
         i = 1;
+#ifdef __ARM_NEON
+        {
+            /* Same fused multiply-add as the scalar code compiles to: */
+            /* fw[2k-1] = fma(fw[2k-2] + fw[2k], c, fw[2k-1])           */
+            const float32x4_t vc = vdupq_n_f32(c);
+            for (; i + 3 < imax; i += 4) {
+                float32x4x2_t v = vld2q_f32(fw - 2);
+                const float32x4_t nx = vextq_f32(v.val[0], vdupq_n_f32(fw[6]), 1);
+                v.val[1] = vfmaq_f32(v.val[1], vaddq_f32(v.val[0], nx), vc);
+                vst2q_f32(fw - 2, v);
+                fw += 8;
+            }
+        }
+#endif
         for (; i + 3 < imax; i += 4) {
             fw[-1] += (fw[-2] + fw[0]) * c;
             fw[1] += (fw[0] + fw[2]) * c;
@@ -1438,6 +1479,7 @@ typedef struct {
     OPJ_UINT32 min_j;
     OPJ_UINT32 max_j;
     opj_encode_and_deinterleave_v_fnptr_type p_encode_and_deinterleave_v;
+    OPJ_UINT32 v_cols; /* columns per call of p_encode_and_deinterleave_v */
 } opj_dwt_encode_v_job_t;
 
 static void opj_dwt_encode_v_func(void* user_data, opj_tls_t* tls)
@@ -1447,13 +1489,13 @@ static void opj_dwt_encode_v_func(void* user_data, opj_tls_t* tls)
     (void)tls;
 
     job = (opj_dwt_encode_v_job_t*)user_data;
-    for (j = job->min_j; j + NB_ELTS_V8 - 1 < job->max_j; j += NB_ELTS_V8) {
+    for (j = job->min_j; j + job->v_cols - 1 < job->max_j; j += job->v_cols) {
         (*job->p_encode_and_deinterleave_v)(job->tiledp + j,
                                             job->v.mem,
                                             job->rh,
                                             job->v.cas == 0,
                                             job->w,
-                                            NB_ELTS_V8);
+                                            job->v_cols);
     }
     if (j < job->max_j) {
         (*job->p_encode_and_deinterleave_v)(job->tiledp + j,
@@ -1790,6 +1832,8 @@ static void opj_dwt_encode_and_deinterleave_v(
     }
 }
 
+#ifndef __ARM_NEON
+/* (NEON builds use opj_dwt_encode_and_deinterleave_v_real_neon16 below) */
 static void opj_v8dwt_encode_step1(OPJ_FLOAT32* fw,
                                    OPJ_UINT32 end,
                                    const OPJ_FLOAT32 cst)
@@ -1935,6 +1979,158 @@ static void opj_dwt_encode_and_deinterleave_v_real(
                                     stride_width, even ? 0 : 1, cols);
     }
 }
+#endif /* __ARM_NEON */
+
+#ifdef __ARM_NEON
+/* NEON: the 9x7 vertical pass works on strips of 16 columns (64 bytes per
+ * row instead of 32). Every column goes through exactly the same operations
+ * as in opj_dwt_encode_and_deinterleave_v_real(), including the fused
+ * multiply-adds the scalar code compiles to on arm64, so the results are
+ * bit-identical. */
+#define NB_ELTS_V16 16
+
+static void opj_v16dwt_encode_step1(OPJ_FLOAT32* fw,
+                                    OPJ_UINT32 end,
+                                    const OPJ_FLOAT32 cst)
+{
+    OPJ_UINT32 i, k;
+    const float32x4_t vcst = vdupq_n_f32(cst);
+    for (i = 0; i < end; ++i) {
+        for (k = 0; k < NB_ELTS_V16; k += 4) {
+            vst1q_f32(fw + k, vmulq_f32(vld1q_f32(fw + k), vcst));
+        }
+        fw += 2 * NB_ELTS_V16;
+    }
+}
+
+static void opj_v16dwt_encode_step2(OPJ_FLOAT32* fl, OPJ_FLOAT32* fw,
+                                    OPJ_UINT32 end,
+                                    OPJ_UINT32 m,
+                                    OPJ_FLOAT32 cst)
+{
+    OPJ_UINT32 i, k;
+    OPJ_UINT32 imax = opj_uint_min(end, m);
+    const float32x4_t vcst = vdupq_n_f32(cst);
+    if (imax > 0) {
+        for (k = 0; k < NB_ELTS_V16; k += 4) {
+            vst1q_f32(fw - NB_ELTS_V16 + k,
+                      vfmaq_f32(vld1q_f32(fw - NB_ELTS_V16 + k),
+                                vaddq_f32(vld1q_f32(fl + k), vld1q_f32(fw + k)), vcst));
+        }
+        fw += 2 * NB_ELTS_V16;
+        for (i = 1; i < imax; ++i) {
+            for (k = 0; k < NB_ELTS_V16; k += 4) {
+                vst1q_f32(fw - NB_ELTS_V16 + k,
+                          vfmaq_f32(vld1q_f32(fw - NB_ELTS_V16 + k),
+                                    vaddq_f32(vld1q_f32(fw - 2 * NB_ELTS_V16 + k),
+                                              vld1q_f32(fw + k)), vcst));
+            }
+            fw += 2 * NB_ELTS_V16;
+        }
+    }
+    if (m < end) {
+        assert(m + 1 == end);
+        for (k = 0; k < NB_ELTS_V16; k += 4) {
+            const float32x4_t w0 = vld1q_f32(fw - 2 * NB_ELTS_V16 + k);
+            vst1q_f32(fw - NB_ELTS_V16 + k,
+                      vfmaq_f32(vld1q_f32(fw - NB_ELTS_V16 + k), vaddq_f32(w0, w0), vcst));
+        }
+    }
+}
+
+/* Forward 9-7 transform, for the vertical pass, processing cols columns */
+/* where cols <= NB_ELTS_V16 */
+static void opj_dwt_encode_and_deinterleave_v_real_neon16(
+    void *arrayIn,
+    void *tmpIn,
+    OPJ_UINT32 height,
+    OPJ_BOOL even,
+    OPJ_UINT32 stride_width,
+    OPJ_UINT32 cols)
+{
+    OPJ_FLOAT32* OPJ_RESTRICT array = (OPJ_FLOAT32 * OPJ_RESTRICT)arrayIn;
+    OPJ_FLOAT32* OPJ_RESTRICT tmp = (OPJ_FLOAT32 * OPJ_RESTRICT)tmpIn;
+    const OPJ_INT32 sn = (OPJ_INT32)((height + (even ? 1 : 0)) >> 1);
+    const OPJ_INT32 dn = (OPJ_INT32)(height - (OPJ_UINT32)sn);
+    OPJ_INT32 a, b, k, pass;
+    OPJ_UINT32 y, c;
+
+    if (height == 1) {
+        return;
+    }
+
+    /* fetch */
+    for (y = 0; y < height; ++y) {
+        const OPJ_FLOAT32* src = array + (OPJ_SIZE_T)y * stride_width;
+        OPJ_FLOAT32* dst = tmp + (OPJ_SIZE_T)y * NB_ELTS_V16;
+        if (cols == NB_ELTS_V16) {
+            memcpy(dst, src, NB_ELTS_V16 * sizeof(OPJ_FLOAT32));
+        } else {
+            for (c = 0; c < cols; c++) {
+                dst[c] = src[c];
+            }
+            for (; c < NB_ELTS_V16; c++) {
+                dst[c] = 0;
+            }
+        }
+    }
+
+    if (even) {
+        a = 0;
+        b = 1;
+    } else {
+        a = 1;
+        b = 0;
+    }
+    opj_v16dwt_encode_step2(tmp + a * NB_ELTS_V16,
+                            tmp + (b + 1) * NB_ELTS_V16,
+                            (OPJ_UINT32)dn,
+                            (OPJ_UINT32)opj_int_min(dn, sn - b),
+                            opj_dwt_alpha);
+    opj_v16dwt_encode_step2(tmp + b * NB_ELTS_V16,
+                            tmp + (a + 1) * NB_ELTS_V16,
+                            (OPJ_UINT32)sn,
+                            (OPJ_UINT32)opj_int_min(sn, dn - a),
+                            opj_dwt_beta);
+    opj_v16dwt_encode_step2(tmp + a * NB_ELTS_V16,
+                            tmp + (b + 1) * NB_ELTS_V16,
+                            (OPJ_UINT32)dn,
+                            (OPJ_UINT32)opj_int_min(dn, sn - b),
+                            opj_dwt_gamma);
+    opj_v16dwt_encode_step2(tmp + b * NB_ELTS_V16,
+                            tmp + (a + 1) * NB_ELTS_V16,
+                            (OPJ_UINT32)sn,
+                            (OPJ_UINT32)opj_int_min(sn, dn - a),
+                            opj_dwt_delta);
+    opj_v16dwt_encode_step1(tmp + b * NB_ELTS_V16, (OPJ_UINT32)dn,
+                            opj_K);
+    opj_v16dwt_encode_step1(tmp + a * NB_ELTS_V16, (OPJ_UINT32)sn,
+                            opj_invK);
+
+    /* deinterleave: low-pass rows first, then high-pass rows */
+    for (pass = 0; pass < 2; pass++) {
+        const OPJ_INT32 n = pass == 0 ? sn : dn;
+        const OPJ_FLOAT32* l_src = tmp + (pass == 0 ? a : b) * NB_ELTS_V16;
+        OPJ_FLOAT32* l_dest = array + (pass == 0 ? 0 : (OPJ_SIZE_T)sn * stride_width);
+        for (k = 0; k < n; k++) {
+            if (cols == NB_ELTS_V16) {
+                memcpy(l_dest, l_src, NB_ELTS_V16 * sizeof(OPJ_FLOAT32));
+            } else {
+                for (c = 0; c < cols; c++) {
+                    l_dest[c] = l_src[c];
+                }
+            }
+            l_dest += stride_width;
+            l_src += 2 * NB_ELTS_V16;
+        }
+    }
+}
+#define OPJ_DWT_ENC_V_COLS_REAL NB_ELTS_V16
+#define OPJ_DWT_ENC_V_REAL opj_dwt_encode_and_deinterleave_v_real_neon16
+#else
+#define OPJ_DWT_ENC_V_COLS_REAL NB_ELTS_V8
+#define OPJ_DWT_ENC_V_REAL opj_dwt_encode_and_deinterleave_v_real
+#endif
 
 
 /* <summary>                            */
@@ -1944,7 +2140,8 @@ static INLINE OPJ_BOOL opj_dwt_encode_procedure(opj_thread_pool_t* tp,
         opj_tcd_tilecomp_t * tilec,
         opj_encode_and_deinterleave_v_fnptr_type p_encode_and_deinterleave_v,
         opj_encode_and_deinterleave_h_one_row_fnptr_type
-        p_encode_and_deinterleave_h_one_row)
+        p_encode_and_deinterleave_h_one_row,
+        OPJ_UINT32 v_cols)
 {
     OPJ_INT32 i;
     OPJ_INT32 *bj = 00;
@@ -1966,11 +2163,11 @@ static INLINE OPJ_BOOL opj_dwt_encode_procedure(opj_thread_pool_t* tp,
 
     l_data_size = opj_dwt_max_resolution(tilec->resolutions, tilec->numresolutions);
     /* overflow check */
-    if (l_data_size > (SIZE_MAX / (NB_ELTS_V8 * sizeof(OPJ_INT32)))) {
+    if (l_data_size > (SIZE_MAX / (v_cols * sizeof(OPJ_INT32)))) {
         /* FIXME event manager error callback */
         return OPJ_FALSE;
     }
-    l_data_size *= NB_ELTS_V8 * sizeof(OPJ_INT32);
+    l_data_size *= v_cols * sizeof(OPJ_INT32);
     bj = (OPJ_INT32*)opj_aligned_32_malloc(l_data_size);
     /* l_data_size is equal to 0 when numresolutions == 1 but bj is not used */
     /* in that case, so do not error out */
@@ -2003,14 +2200,14 @@ static INLINE OPJ_BOOL opj_dwt_encode_procedure(opj_thread_pool_t* tp,
         dn = (OPJ_INT32)(rh - rh1);
 
         /* Perform vertical pass */
-        if (num_threads <= 1 || rw < 2 * NB_ELTS_V8) {
-            for (j = 0; j + NB_ELTS_V8 - 1 < rw; j += NB_ELTS_V8) {
+        if (num_threads <= 1 || rw < 2 * v_cols) {
+            for (j = 0; j + v_cols - 1 < rw; j += v_cols) {
                 p_encode_and_deinterleave_v(tiledp + j,
                                             bj,
                                             rh,
                                             cas_col == 0,
                                             w,
-                                            NB_ELTS_V8);
+                                            v_cols);
             }
             if (j < rw) {
                 p_encode_and_deinterleave_v(tiledp + j,
@@ -2027,7 +2224,7 @@ static INLINE OPJ_BOOL opj_dwt_encode_procedure(opj_thread_pool_t* tp,
             if (rw < num_jobs) {
                 num_jobs = rw;
             }
-            step_j = ((rw / num_jobs) / NB_ELTS_V8) * NB_ELTS_V8;
+            step_j = ((rw / num_jobs) / v_cols) * v_cols;
 
             for (j = 0; j < num_jobs; j++) {
                 opj_dwt_encode_v_job_t* job;
@@ -2054,6 +2251,7 @@ static INLINE OPJ_BOOL opj_dwt_encode_procedure(opj_thread_pool_t* tp,
                 job->min_j = j * step_j;
                 job->max_j = (j + 1 == num_jobs) ? rw : (j + 1) * step_j;
                 job->p_encode_and_deinterleave_v = p_encode_and_deinterleave_v;
+                job->v_cols = v_cols;
                 opj_thread_pool_submit_job(tp, opj_dwt_encode_v_func, job);
             }
             opj_thread_pool_wait_completion(tp, 0);
@@ -2127,7 +2325,8 @@ OPJ_BOOL opj_dwt_encode(opj_tcd_t *p_tcd,
 {
     return opj_dwt_encode_procedure(p_tcd->thread_pool, tilec,
                                     opj_dwt_encode_and_deinterleave_v,
-                                    opj_dwt_encode_and_deinterleave_h_one_row);
+                                    opj_dwt_encode_and_deinterleave_h_one_row,
+                                    NB_ELTS_V8);
 }
 
 /* <summary>                            */
@@ -2166,8 +2365,9 @@ OPJ_BOOL opj_dwt_encode_real(opj_tcd_t *p_tcd,
                              opj_tcd_tilecomp_t * tilec)
 {
     return opj_dwt_encode_procedure(p_tcd->thread_pool, tilec,
-                                    opj_dwt_encode_and_deinterleave_v_real,
-                                    opj_dwt_encode_and_deinterleave_h_one_row_real);
+                                    OPJ_DWT_ENC_V_REAL,
+                                    opj_dwt_encode_and_deinterleave_h_one_row_real,
+                                    OPJ_DWT_ENC_V_COLS_REAL);
 }
 
 /* <summary>                */

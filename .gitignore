@@ -16,3 +16,5 @@ scripts/opjstyle*
 
 # Ignore directories made by `make`.
 /bin/
+reference_frames/
+.DS_Store

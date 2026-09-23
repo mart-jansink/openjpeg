@@ -1,3 +1,4 @@
+# Copyright (c) 2026, CtrlMovie AG
 # Main CMakeLists.txt to build the OpenJPEG project using CMake (www.cmake.org)
 # Written by Mathieu Malaterre
 
@@ -220,6 +221,13 @@ if(BUILD_JPIP_SERVER)
   if(NOT CMAKE_USE_PTHREADS_INIT)
     message(FATAL_ERROR "Only pthread are supported")
   endif()
+endif()
+if(APPLE)
+option(OPJ_USE_METAL "Build the experimental Metal (Apple GPU) T1 encoder prototype" OFF)
+if(OPJ_USE_METAL)
+  enable_language(OBJC)
+  set(OPJ_HAVE_METAL_T1 ON) # opj_config.h
+endif()
 endif()
 add_subdirectory(src/lib)
 option(BUILD_LUTS_GENERATOR "Build utility to generate t1_luts.h" OFF)

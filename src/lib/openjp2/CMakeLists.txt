@@ -1,3 +1,4 @@
+# Copyright (c) 2026, CtrlMovie AG
 include_regular_expression("^.*$")
 
 #
@@ -194,6 +195,14 @@ if(OPJ_USE_THREAD AND Threads_FOUND AND CMAKE_USE_PTHREADS_INIT)
 endif(OPJ_USE_THREAD AND Threads_FOUND AND CMAKE_USE_PTHREADS_INIT)
 
 if(BUILD_UNIT_TESTS AND UNIX)
+    add_executable(bench_encode bench_encode.c)
+    target_link_libraries(bench_encode ${OPENJPEG_LIBRARY_NAME})
+    if(UNIX)
+        target_link_libraries(bench_encode m)
+    endif()
+    if(OPJ_USE_THREAD AND CMAKE_USE_PTHREADS_INIT)
+        target_link_libraries(bench_encode ${CMAKE_THREAD_LIBS_INIT})
+    endif()
     add_executable(bench_dwt bench_dwt.c)
     if(UNIX)
         target_link_libraries(bench_dwt m ${OPENJPEG_LIBRARY_NAME})
@@ -210,3 +219,7 @@ if(BUILD_UNIT_TESTS AND UNIX)
         target_link_libraries(test_sparse_array ${CMAKE_THREAD_LIBS_INIT})
     endif(OPJ_USE_THREAD AND Threads_FOUND AND CMAKE_USE_PTHREADS_INIT)
 endif(BUILD_UNIT_TESTS AND UNIX)
+
+if(OPJ_USE_METAL AND APPLE)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/metal/opj_metal.cmake)
+endif()
