@@ -201,7 +201,7 @@ static void opj_mtl_init_shared(void* unused)
                                                  length:opj_metal_t1_src_len
                                                encoding:NSUTF8StringEncoding];
         MTLCompileOptions* opts = [MTLCompileOptions new];
-        opts.mathMode = MTLMathModeSafe;
+        /* opts.mathMode = MTLMathModeSafe; */
         NSError* err = nil;
         id<MTLLibrary> lib = [s.device newLibraryWithSource:src options:opts
                                                       error:&err];
