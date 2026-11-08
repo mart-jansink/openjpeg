@@ -18,6 +18,7 @@
  * Copyright (c) 2012, CS Systemes d'Information, France
  * Copyright (c) 2017, IntoPIX SA <support@intopix.com>
  * Copyright (c) 2026, CtrlMovie AG
+ * Copyright (c) 2026, Mart Jansink
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -10174,6 +10175,69 @@ OPJ_BOOL opj_j2k_read_tile_header(opj_j2k_t * p_j2k,
     return OPJ_TRUE;
 }
 
+/* METAL_T1 decoder option, or the OPJ_METAL_T1_DECODE environment variable
+ * when the option is not set. Only effective with OPJ_USE_METAL builds.
+ * Fork extension. */
+static OPJ_BOOL opj_j2k_use_metal_t1_decode(const opj_j2k_t * p_j2k)
+{
+    const OPJ_UINT32 opt = p_j2k->m_specific_param.m_decoder.m_metal_t1;
+    if (opt != 0) {
+        return opt == 2 ? OPJ_TRUE : OPJ_FALSE;
+    } else {
+        const char* env = getenv("OPJ_METAL_T1_DECODE");
+        return (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) ?
+               OPJ_TRUE : OPJ_FALSE;
+    }
+}
+
+OPJ_BOOL opj_j2k_decoder_set_extra_options(
+    opj_j2k_t *p_j2k,
+    const char* const* p_options,
+    opj_event_mgr_t * p_manager)
+{
+    const char* const* p_option_iter;
+
+    if (p_options == NULL) {
+        return OPJ_TRUE;
+    }
+
+    for (p_option_iter = p_options; *p_option_iter != NULL; ++p_option_iter) {
+        if (strncmp(*p_option_iter, "METAL_T1=", strlen("METAL_T1=")) == 0) {
+            if (strcmp(*p_option_iter, "METAL_T1=YES") == 0) {
+#ifndef OPJ_USE_METAL
+                opj_event_msg(p_manager, EVT_WARNING,
+                              "METAL_T1=YES ignored: library built without "
+                              "OPJ_USE_METAL.\n");
+#endif
+                p_j2k->m_specific_param.m_decoder.m_metal_t1 = 2;
+            } else if (strcmp(*p_option_iter, "METAL_T1=NO") == 0) {
+                p_j2k->m_specific_param.m_decoder.m_metal_t1 = 1;
+            } else {
+                opj_event_msg(p_manager, EVT_ERROR,
+                              "Invalid value for option: %s.\n", *p_option_iter);
+                return OPJ_FALSE;
+            }
+        } else if (strncmp(*p_option_iter, "OUTPUT_MCT_DOMAIN=",
+                           strlen("OUTPUT_MCT_DOMAIN=")) == 0) {
+            if (strcmp(*p_option_iter, "OUTPUT_MCT_DOMAIN=YES") == 0) {
+                p_j2k->m_specific_param.m_decoder.m_output_mct_domain = OPJ_TRUE;
+            } else if (strcmp(*p_option_iter, "OUTPUT_MCT_DOMAIN=NO") == 0) {
+                p_j2k->m_specific_param.m_decoder.m_output_mct_domain = OPJ_FALSE;
+            } else {
+                opj_event_msg(p_manager, EVT_ERROR,
+                              "Invalid value for option: %s.\n", *p_option_iter);
+                return OPJ_FALSE;
+            }
+        } else {
+            opj_event_msg(p_manager, EVT_ERROR,
+                          "Invalid option: %s.\n", *p_option_iter);
+            return OPJ_FALSE;
+        }
+    }
+
+    return OPJ_TRUE;
+}
+
 OPJ_BOOL opj_j2k_decode_tile(opj_j2k_t * p_j2k,
                              OPJ_UINT32 p_tile_index,
                              OPJ_BYTE * p_data,
@@ -10209,6 +10273,9 @@ OPJ_BOOL opj_j2k_decode_tile(opj_j2k_t * p_j2k,
     /* but full tile decoding is done */
     l_image_for_bounds = p_j2k->m_output_image ? p_j2k->m_output_image :
                          p_j2k->m_private_image;
+    p_j2k->m_tcd->metal_t1 = opj_j2k_use_metal_t1_decode(p_j2k);
+    p_j2k->m_tcd->output_mct_domain =
+        p_j2k->m_specific_param.m_decoder.m_output_mct_domain;
     if (! opj_tcd_decode_tile(p_j2k->m_tcd,
                               l_image_for_bounds->x0,
                               l_image_for_bounds->y0,

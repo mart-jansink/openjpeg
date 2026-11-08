@@ -7,6 +7,7 @@
  * Copyright (c) 2005, Herve Drolon, FreeImage Team
  * Copyright (c) 2008, 2011-2012, Centre National d'Etudes Spatiales (CNES), FR
  * Copyright (c) 2012, CS Systemes d'Information, France
+ * Copyright (c) 2026, Mart Jansink
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -271,6 +272,11 @@ opj_codec_t* OPJ_CALLCONV opj_create_decompress(OPJ_CODEC_FORMAT p_format)
                          const OPJ_UINT32 * comps_indices,
                          struct opj_event_mgr * p_manager)) opj_j2k_set_decoded_components;
 
+        l_codec->m_codec_data.m_decompression.opj_decoder_set_extra_options =
+            (OPJ_BOOL(*)(void * p_codec,
+                         const char* const* p_options,
+                         struct opj_event_mgr * p_manager)) opj_j2k_decoder_set_extra_options;
+
         l_codec->opj_set_threads =
             (OPJ_BOOL(*)(void * p_codec, OPJ_UINT32 num_threads)) opj_j2k_set_threads;
 
@@ -361,6 +367,11 @@ opj_codec_t* OPJ_CALLCONV opj_create_decompress(OPJ_CODEC_FORMAT p_format)
                          OPJ_UINT32 numcomps,
                          const OPJ_UINT32 * comps_indices,
                          struct opj_event_mgr * p_manager)) opj_jp2_set_decoded_components;
+
+        l_codec->m_codec_data.m_decompression.opj_decoder_set_extra_options =
+            (OPJ_BOOL(*)(void * p_codec,
+                         const char* const* p_options,
+                         struct opj_event_mgr * p_manager)) opj_jp2_decoder_set_extra_options;
 
         l_codec->opj_set_threads =
             (OPJ_BOOL(*)(void * p_codec, OPJ_UINT32 num_threads)) opj_jp2_set_threads;
@@ -507,6 +518,26 @@ OPJ_BOOL OPJ_CALLCONV opj_set_decoded_components(opj_codec_t *p_codec,
                     numcomps,
                     comps_indices,
                     &(l_codec->m_event_mgr));
+    }
+    return OPJ_FALSE;
+}
+
+OPJ_BOOL OPJ_CALLCONV opj_decoder_set_extra_options(opj_codec_t *p_codec,
+        const char* const* options)
+{
+    if (p_codec) {
+        opj_codec_private_t * l_codec = (opj_codec_private_t *) p_codec;
+
+        if (! l_codec->is_decompressor) {
+            opj_event_msg(&(l_codec->m_event_mgr), EVT_ERROR,
+                          "Codec provided to the opj_decoder_set_extra_options function is not a decompressor handler.\n");
+            return OPJ_FALSE;
+        }
+
+        return l_codec->m_codec_data.m_decompression.opj_decoder_set_extra_options(
+                   l_codec->m_codec,
+                   options,
+                   &(l_codec->m_event_mgr));
     }
     return OPJ_FALSE;
 }

@@ -15,6 +15,7 @@
  * Copyright (c) 2007, Callum Lerwick <seg@haxxed.com>
  * Copyright (c) 2017, IntoPIX SA <support@intopix.com>
  * Copyright (c) 2026, CtrlMovie AG
+ * Copyright (c) 2026, Mart Jansink
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -3719,6 +3720,283 @@ static void opj_v8dwt_decode(opj_v8dwt_t* OPJ_RESTRICT dwt)
 #endif
 }
 
+
+/* The vertical pass of the inverse 9/7 DWT works on strips of NB_ELTS_V8
+ * columns. The original code did one strip per sweep over all the rows: it
+ * gathered the strip into a buffer, lifted the whole buffer, then wrote it
+ * back. That reads and writes only 32 bytes of each row's cache line, and
+ * the line is gone by the time the write-back or the next strip comes
+ * around when the rows map to few cache sets: with a row stride that is a
+ * large power of two (2048 or 4096 samples: scope and full-container DCPs)
+ * the pass was 2.5 to 3 times slower than at a width of 1998 or 3996.
+ *
+ * So the pass now
+ * - handles up to OPJ_V8DWT_V_STRIPS adjacent strips per sweep, which reads
+ *   and writes whole cache lines (128 bytes on Apple silicon);
+ * - pipelines the lifting down the column: it gathers OPJ_V8DWT_V_CHUNK rows
+ *   at a time, runs each lifting step as far as the rows gathered so far
+ *   allow, and writes back the rows that are final. The top half of the
+ *   rows is then written within a chunk of being read (the bottom half
+ *   has to wait until the lifting reaches it; see
+ *   opj_v8dwt_decode_v_strips());
+ * - prefetches the rows it is about to gather.
+ * Each sample still goes through the same lifting steps with the same
+ * operands, so the output is bit-identical. */
+#ifndef OPJ_V8DWT_V_STRIPS
+#define OPJ_V8DWT_V_STRIPS 4
+#endif
+#ifndef OPJ_V8DWT_V_CHUNK
+#define OPJ_V8DWT_V_CHUNK 32
+#endif
+/* At a row stride of 16 KB (4096 samples) every row of a strip maps to
+ * the same L1 set, so the hardware prefetcher's lines evict each other
+ * before use. Prefetching this many buffer positions ahead brings the 4K
+ * gather back to the speed it has at a width of 3996. */
+#ifndef OPJ_V8DWT_V_PREFETCH
+#define OPJ_V8DWT_V_PREFETCH 32
+#endif
+#if defined(__GNUC__) || defined(__clang__)
+#define OPJ_V8DWT_PREFETCH(addr) __builtin_prefetch((addr), 0, 3)
+#else
+#define OPJ_V8DWT_PREFETCH(addr) ((void)(addr))
+#endif
+
+/* Distance between the strip buffers of opj_v8dwt_decode_v_strips(), in
+ * opj_v8_t. The padding (4 x 32 bytes) keeps the same row of different
+ * strips out of the same cache set when l_data_size is a power of two. */
+static OPJ_SIZE_T opj_v8dwt_v_strip_stride(OPJ_SIZE_T l_data_size)
+{
+    return l_data_size + 4;
+}
+
+/* The lifting steps of opj_v8dwt_decode() for whichever SIMD flavour is
+ * built. The step functions work on any [start, end) sub-range with the
+ * same result per sample, as the windowed decoder relies on too. */
+static INLINE void opj_v8dwt_lift_step1(opj_v8_t* w, OPJ_INT32 start,
+                                        OPJ_INT32 end, OPJ_FLOAT32 c)
+{
+    if (start >= end) {
+        return;
+    }
+#ifdef __SSE__
+    opj_v8dwt_decode_step1_sse(w, (OPJ_UINT32)start, (OPJ_UINT32)end,
+                               _mm_set1_ps(c));
+#elif defined(__ARM_NEON)
+    opj_v8dwt_decode_step1_neon(w, (OPJ_UINT32)start, (OPJ_UINT32)end, c);
+#else
+    opj_v8dwt_decode_step1(w, (OPJ_UINT32)start, (OPJ_UINT32)end, c);
+#endif
+}
+
+/* Must not be called with an empty range: with end == m + 1 the step
+ * function applies the right boundary even when no sample is in range. */
+static INLINE void opj_v8dwt_lift_step2(opj_v8_t* l, opj_v8_t* w,
+                                        OPJ_INT32 start, OPJ_INT32 end,
+                                        OPJ_INT32 m, OPJ_FLOAT32 c)
+{
+    if (start >= end) {
+        return;
+    }
+#ifdef __SSE__
+    opj_v8dwt_decode_step2_sse(l, w, (OPJ_UINT32)start, (OPJ_UINT32)end,
+                               (OPJ_UINT32)m, _mm_set1_ps(c));
+#elif defined(__ARM_NEON)
+    opj_v8dwt_decode_step2_neon(l, w, (OPJ_UINT32)start, (OPJ_UINT32)end,
+                                (OPJ_UINT32)m, c);
+#else
+    opj_v8dwt_decode_step2(l, w, (OPJ_UINT32)start, (OPJ_UINT32)end,
+                           (OPJ_UINT32)m, c);
+#endif
+}
+
+/* The tile row that holds buffer position p of a column: low band sample
+ * (p - a) / 2 in row (p - a) / 2, or high band sample (p - b) / 2 in row
+ * sn + (p - b) / 2. */
+static INLINE const OPJ_FLOAT32* opj_v8dwt_v_source_row(
+    const OPJ_FLOAT32* aj, OPJ_UINT32 w, OPJ_INT32 sn, OPJ_INT32 a,
+    OPJ_INT32 b, OPJ_INT32 p)
+{
+    if ((p & 1) == a) {
+        return aj + (OPJ_SIZE_T)((p - a) >> 1) * w;
+    }
+    return aj + (OPJ_SIZE_T)(sn + ((p - b) >> 1)) * w;
+}
+
+/* Copies rows [*row, end) of nb_strips strips from buf back to the tile and
+ * advances *row. */
+static INLINE void opj_v8dwt_v_write_rows(const opj_v8_t* OPJ_RESTRICT buf,
+        OPJ_SIZE_T strip_stride,
+        OPJ_FLOAT32* OPJ_RESTRICT aj,
+        OPJ_UINT32 w,
+        OPJ_UINT32 nb_strips,
+        OPJ_INT32* row,
+        OPJ_INT32 end)
+{
+    OPJ_INT32 r;
+    OPJ_UINT32 s;
+    for (r = *row; r < end; r++) {
+        OPJ_FLOAT32* OPJ_RESTRICT dst = aj + (OPJ_SIZE_T)r * w;
+        for (s = 0; s < nb_strips; s++) {
+            memcpy(dst + s * NB_ELTS_V8, &buf[s * strip_stride + (OPJ_SIZE_T)r],
+                   NB_ELTS_V8 * sizeof(OPJ_FLOAT32));
+        }
+    }
+    if (end > *row) {
+        *row = end;
+    }
+}
+
+/* Inverse vertical 9/7 transform of nb_strips (1 to OPJ_V8DWT_V_STRIPS)
+ * adjacent strips of NB_ELTS_V8 columns over all rh rows, the first strip
+ * starting at aj. v holds the band split (sn, dn, cas) of the whole
+ * column; its window and wavelet members are not used. buf has room for
+ * nb_strips buffers of strip_stride opj_v8_t each.
+ *
+ * Does what opj_v8dwt_interleave_v() + opj_v8dwt_decode() + the copy back
+ * do per strip, in a different order. In buffer positions p (row p of the
+ * output), the low band sample i sits at p = a + 2i and the high band
+ * sample j at p = b + 2j. The steps are
+ *   1. scale low by K, high by two_invK
+ *   2. low  i += delta * (high neighbours)  (each step reads the two
+ *   3. high j += gamma * (low neighbours)    neighbours at p - 1 and
+ *   4. low  i += beta  * (high neighbours)   p + 1, mirrored at the
+ *   5. high j += alpha * (low neighbours)    ends)
+ * Low i's high neighbours are j = i - b and i - b + 1, and high j's low
+ * neighbours are i = j - a and j - a + 1. So with the high band done
+ * (by the previous step) for j < H, step 2 or 4 can do i < H - a; with
+ * the low band done for i < L, step 3 or 5 can do j < L - b. A low sample
+ * is final after step 4, a high one after step 5. The transform is in
+ * place: output row r can only be written once source row r (low sample r
+ * if r < sn, else high sample r - sn) has been gathered. */
+static void opj_v8dwt_decode_v_strips(const opj_v8dwt_t* OPJ_RESTRICT v,
+                                      opj_v8_t* OPJ_RESTRICT buf,
+                                      OPJ_SIZE_T strip_stride,
+                                      OPJ_FLOAT32* OPJ_RESTRICT aj,
+                                      OPJ_UINT32 w,
+                                      OPJ_UINT32 rh,
+                                      OPJ_UINT32 nb_strips)
+{
+    /* As in opj_v8dwt_decode() */
+    const OPJ_FLOAT32 two_invK = 1.625732422f;
+    const OPJ_INT32 sn = v->sn;
+    const OPJ_INT32 dn = v->dn;
+    const OPJ_INT32 n = sn + dn;
+    OPJ_INT32 a, b, m_l, m_h;
+    /* Rows gathered; rows of [0, sn) and [sn, n) written; low and high
+     * samples done per step */
+    OPJ_INT32 p = 0, written_l = 0, written_h = v->sn;
+    OPJ_INT32 l1 = 0, h1 = 0, l2 = 0, h3 = 0, l4 = 0, h5 = 0;
+    OPJ_UINT32 s;
+
+    assert(nb_strips >= 1 && nb_strips <= OPJ_V8DWT_V_STRIPS);
+    assert(n == (OPJ_INT32)rh);
+    OPJ_UNUSED(rh);
+
+    /* As in opj_v8dwt_decode(): a single sample is left as it is */
+    if (v->cas == 0) {
+        if (!((dn > 0) || (sn > 1))) {
+            return;
+        }
+        a = 0;
+        b = 1;
+    } else {
+        if (!((sn > 0) || (dn > 1))) {
+            return;
+        }
+        a = 1;
+        b = 0;
+    }
+    m_l = opj_int_min(sn, dn - a);
+    m_h = opj_int_min(dn, sn - b);
+
+    while (p < n) {
+        const OPJ_INT32 p1 = opj_int_min(p + OPJ_V8DWT_V_CHUNK, n);
+        const OPJ_BOOL all = (p1 == n);
+        OPJ_INT32 l1n, h1n, l2n, h3n, l4n, h5n, out;
+
+        /* Gather rows [p, p1), prefetching the rows of position
+         * p + OPJ_V8DWT_V_PREFETCH */
+        for (; p < p1; p++) {
+            const OPJ_FLOAT32* OPJ_RESTRICT src;
+            const OPJ_INT32 q = p + OPJ_V8DWT_V_PREFETCH;
+            if (q < n) {
+                const OPJ_FLOAT32* pf = opj_v8dwt_v_source_row(aj, w, sn, a, b, q);
+                OPJ_V8DWT_PREFETCH(pf);
+                OPJ_V8DWT_PREFETCH(pf + nb_strips * NB_ELTS_V8 - 1);
+            }
+            src = opj_v8dwt_v_source_row(aj, w, sn, a, b, p);
+            for (s = 0; s < nb_strips; s++) {
+                memcpy(&buf[s * strip_stride + (OPJ_SIZE_T)p],
+                       src + s * NB_ELTS_V8, NB_ELTS_V8 * sizeof(OPJ_FLOAT32));
+            }
+        }
+
+        /* How far each step can go */
+        l1n = opj_int_min(sn, (p1 - a + 1) / 2);
+        h1n = opj_int_min(dn, (p1 - b + 1) / 2);
+        if (all) {
+            l2n = sn;
+            h3n = dn;
+            l4n = sn;
+            h5n = dn;
+        } else {
+            l2n = opj_int_max(l2, opj_int_min(sn, h1n - a));
+            h3n = opj_int_max(h3, opj_int_min(dn, l2n - b));
+            l4n = opj_int_max(l4, opj_int_min(sn, h3n - a));
+            h5n = opj_int_max(h5, opj_int_min(dn, l4n - b));
+        }
+
+        for (s = 0; s < nb_strips; s++) {
+            opj_v8_t* B = buf + s * strip_stride;
+            opj_v8dwt_lift_step1(B + a, l1, l1n, opj_K);
+            opj_v8dwt_lift_step1(B + b, h1, h1n, two_invK);
+            opj_v8dwt_lift_step2(B + b, B + a + 1, l2, l2n, m_l, -opj_dwt_delta);
+            opj_v8dwt_lift_step2(B + a, B + b + 1, h3, h3n, m_h, -opj_dwt_gamma);
+            opj_v8dwt_lift_step2(B + b, B + a + 1, l4, l4n, m_l, -opj_dwt_beta);
+            opj_v8dwt_lift_step2(B + a, B + b + 1, h5, h5n, m_h, -opj_dwt_alpha);
+        }
+        l1 = l1n;
+        h1 = h1n;
+        l2 = l2n;
+        h3 = h3n;
+        l4 = l4n;
+        h5 = h5n;
+
+        /* Write back the rows that are final and whose source row has been
+         * gathered. Rows [0, sn) hold the low band, gathered at about twice
+         * their row number, so they are written just after being read. Rows
+         * [sn, n) hold the high band, gathered earlier. */
+        out = all ? n : opj_int_min(a + 2 * l4, b + 2 * h5);
+        opj_v8dwt_v_write_rows(buf, strip_stride, aj, w, nb_strips, &written_l,
+                               all ? sn : opj_int_min(out, l1));
+        opj_v8dwt_v_write_rows(buf, strip_stride, aj, w, nb_strips, &written_h,
+                               all ? n : opj_int_min(out, sn + h1));
+    }
+}
+
+/* Inverse vertical 9/7 transform of the nb_columns (a multiple of
+ * NB_ELTS_V8) columns starting at aj, OPJ_V8DWT_V_STRIPS strips at a
+ * time. */
+static void opj_v8dwt_decode_v_columns(const opj_v8dwt_t* OPJ_RESTRICT v,
+                                       opj_v8_t* OPJ_RESTRICT buf,
+                                       OPJ_SIZE_T strip_stride,
+                                       OPJ_FLOAT32* OPJ_RESTRICT aj,
+                                       OPJ_UINT32 w,
+                                       OPJ_UINT32 rh,
+                                       OPJ_UINT32 nb_columns)
+{
+    OPJ_UINT32 strips = nb_columns / NB_ELTS_V8;
+
+    assert((nb_columns % NB_ELTS_V8) == 0);
+
+    while (strips > 0) {
+        OPJ_UINT32 n = opj_uint_min(strips, OPJ_V8DWT_V_STRIPS);
+        opj_v8dwt_decode_v_strips(v, buf, strip_stride, aj, w, rh, n);
+        aj += n * NB_ELTS_V8;
+        strips -= n;
+    }
+}
+
 typedef struct {
     opj_v8dwt_t h;
     OPJ_UINT32 rw;
@@ -3774,34 +4052,73 @@ typedef struct {
     OPJ_UINT32 w;
     OPJ_FLOAT32 * OPJ_RESTRICT aj;
     OPJ_UINT32 nb_columns;
+    OPJ_SIZE_T strip_stride;
+    /* Set to OPJ_FALSE when the job cannot allocate its buffers */
+    volatile OPJ_BOOL* pret;
 } opj_dwt97_decode_v_job_t;
+
+/* Strip buffers of a thread pool worker, kept in its TLS: at 140 KB (2K)
+ * to 530 KB (4K) per job and resolution level, allocating them afresh each
+ * time costs page faults. */
+typedef struct {
+    opj_v8_t* buf;
+    OPJ_SIZE_T size; /* in opj_v8_t */
+} opj_dwt97_v_tls_t;
+
+static void opj_dwt97_v_tls_free(void* value)
+{
+    opj_dwt97_v_tls_t* t = (opj_dwt97_v_tls_t*)value;
+    if (t) {
+        opj_aligned_free(t->buf);
+        opj_free(t);
+    }
+}
+
+/* Returns this worker's strip buffers, with room for size opj_v8_t, or NULL
+ * if out of memory. */
+static opj_v8_t* opj_dwt97_v_tls_buffer(opj_tls_t* tls, OPJ_SIZE_T size)
+{
+    opj_dwt97_v_tls_t* t = (opj_dwt97_v_tls_t*)opj_tls_get(tls,
+                           OPJ_TLS_KEY_DWT97_V);
+    if (!t) {
+        t = (opj_dwt97_v_tls_t*)opj_calloc(1, sizeof(opj_dwt97_v_tls_t));
+        if (!t) {
+            return NULL;
+        }
+        if (!opj_tls_set(tls, OPJ_TLS_KEY_DWT97_V, t, opj_dwt97_v_tls_free)) {
+            opj_free(t);
+            return NULL;
+        }
+    }
+    if (t->size < size) {
+        opj_aligned_free(t->buf);
+        t->size = 0;
+        t->buf = (opj_v8_t*)opj_aligned_malloc(size * sizeof(opj_v8_t));
+        if (!t->buf) {
+            return NULL;
+        }
+        t->size = size;
+    }
+    return t->buf;
+}
 
 static void opj_dwt97_decode_v_func(void* user_data, opj_tls_t* tls)
 {
-    OPJ_UINT32 j;
     opj_dwt97_decode_v_job_t* job;
-    OPJ_FLOAT32 * OPJ_RESTRICT aj;
-    (void)tls;
+    opj_v8_t* buf;
 
     job = (opj_dwt97_decode_v_job_t*)user_data;
 
     assert((job->nb_columns % NB_ELTS_V8) == 0);
 
-    aj = job->aj;
-    for (j = 0; j + NB_ELTS_V8 <= job->nb_columns; j += NB_ELTS_V8) {
-        OPJ_UINT32 k;
-
-        opj_v8dwt_interleave_v(&job->v, aj, job->w, NB_ELTS_V8);
-        opj_v8dwt_decode(&job->v);
-
-        for (k = 0; k < job->rh; ++k) {
-            memcpy(&aj[k * (OPJ_SIZE_T)job->w], &job->v.wavelet[k],
-                   NB_ELTS_V8 * sizeof(OPJ_FLOAT32));
-        }
-        aj += NB_ELTS_V8;
+    buf = opj_dwt97_v_tls_buffer(tls, OPJ_V8DWT_V_STRIPS * job->strip_stride);
+    if (buf) {
+        opj_v8dwt_decode_v_columns(&job->v, buf, job->strip_stride, job->aj,
+                                   job->w, job->rh, job->nb_columns);
+    } else {
+        *(job->pret) = OPJ_FALSE;
     }
 
-    opj_aligned_free(job->v.wavelet);
     opj_free(job);
 }
 
@@ -3828,7 +4145,7 @@ OPJ_BOOL opj_dwt_decode_tile_97(opj_thread_pool_t* tp,
                                                                1].x1 -
                                 tilec->resolutions[tilec->minimum_num_resolutions - 1].x0);
 
-    OPJ_SIZE_T l_data_size;
+    OPJ_SIZE_T l_data_size, strip_stride;
     const int num_threads = opj_thread_pool_get_thread_count(tp);
 
     if (numres == 1) {
@@ -3836,12 +4153,16 @@ OPJ_BOOL opj_dwt_decode_tile_97(opj_thread_pool_t* tp,
     }
 
     l_data_size = opj_dwt_max_resolution(res, numres);
+    strip_stride = opj_v8dwt_v_strip_stride(l_data_size);
     /* overflow check */
-    if (l_data_size > (SIZE_MAX / sizeof(opj_v8_t))) {
+    if (strip_stride > (SIZE_MAX / (OPJ_V8DWT_V_STRIPS * sizeof(opj_v8_t)))) {
         /* FIXME event manager error callback */
         return OPJ_FALSE;
     }
-    h.wavelet = (opj_v8_t*) opj_aligned_malloc(l_data_size * sizeof(opj_v8_t));
+    /* Used by the horizontal pass (l_data_size entries) and the vertical
+     * pass (OPJ_V8DWT_V_STRIPS strip buffers) */
+    h.wavelet = (opj_v8_t*) opj_aligned_malloc(OPJ_V8DWT_V_STRIPS * strip_stride *
+                sizeof(opj_v8_t));
     if (!h.wavelet) {
         /* FIXME event manager error callback */
         return OPJ_FALSE;
@@ -3956,29 +4277,28 @@ OPJ_BOOL opj_dwt_decode_tile_97(opj_thread_pool_t* tp,
 
         aj = (OPJ_FLOAT32*) tilec->data;
         if (num_threads <= 1 || rw < 2 * NB_ELTS_V8) {
-            for (j = rw; j > (NB_ELTS_V8 - 1); j -= NB_ELTS_V8) {
-                OPJ_UINT32 k;
-
-                opj_v8dwt_interleave_v(&v, aj, w, NB_ELTS_V8);
-                opj_v8dwt_decode(&v);
-
-                for (k = 0; k < rh; ++k) {
-                    memcpy(&aj[k * (OPJ_SIZE_T)w], &v.wavelet[k], NB_ELTS_V8 * sizeof(OPJ_FLOAT32));
-                }
-                aj += NB_ELTS_V8;
-            }
+            OPJ_UINT32 nb_columns = rw & (OPJ_UINT32)~(NB_ELTS_V8 - 1);
+            opj_v8dwt_decode_v_columns(&v, h.wavelet, strip_stride, aj, w, rh,
+                                       nb_columns);
+            aj += nb_columns;
         } else {
-            /* "bench_dwt -I" shows that scaling is poor, likely due to RAM
-                transfer being the limiting factor. So limit the number of
-                threads.
-             */
-            OPJ_UINT32 num_jobs = opj_uint_max((OPJ_UINT32)num_threads / 2, 2U);
+            /* Upstream used num_threads / 2 jobs here, as the pass did not
+               scale ("bench_dwt -I"). With whole cache lines per sweep it
+               does: one job per thread is 1.2 to 1.5 times faster at 4 and
+               8 threads, and more jobs than threads are slower again. */
+            OPJ_UINT32 num_jobs = (OPJ_UINT32)num_threads;
             OPJ_UINT32 step_j;
+            const OPJ_UINT32 group = NB_ELTS_V8 * OPJ_V8DWT_V_STRIPS;
+            volatile OPJ_BOOL v_ret = OPJ_TRUE;
 
             if ((rw / NB_ELTS_V8) < num_jobs) {
                 num_jobs = rw / NB_ELTS_V8;
             }
-            step_j = ((rw / num_jobs) / NB_ELTS_V8) * NB_ELTS_V8;
+            /* Give each job whole strip groups where possible */
+            step_j = ((rw / num_jobs) / group) * group;
+            if (step_j == 0) {
+                step_j = ((rw / num_jobs) / NB_ELTS_V8) * NB_ELTS_V8;
+            }
             for (j = 0; j < num_jobs; j++) {
                 opj_dwt97_decode_v_job_t* job;
 
@@ -3988,13 +4308,8 @@ OPJ_BOOL opj_dwt_decode_tile_97(opj_thread_pool_t* tp,
                     opj_aligned_free(h.wavelet);
                     return OPJ_FALSE;
                 }
-                job->v.wavelet = (opj_v8_t*)opj_aligned_malloc(l_data_size * sizeof(opj_v8_t));
-                if (!job->v.wavelet) {
-                    opj_thread_pool_wait_completion(tp, 0);
-                    opj_free(job);
-                    opj_aligned_free(h.wavelet);
-                    return OPJ_FALSE;
-                }
+                job->v.wavelet = NULL;
+                job->pret = &v_ret;
                 job->v.dn = v.dn;
                 job->v.sn = v.sn;
                 job->v.cas = v.cas;
@@ -4005,12 +4320,17 @@ OPJ_BOOL opj_dwt_decode_tile_97(opj_thread_pool_t* tp,
                 job->rh = rh;
                 job->w = w;
                 job->aj = aj;
+                job->strip_stride = strip_stride;
                 job->nb_columns = (j + 1 == num_jobs) ? (rw & (OPJ_UINT32)~
                                   (NB_ELTS_V8 - 1)) - j * step_j : step_j;
                 aj += job->nb_columns;
                 opj_thread_pool_submit_job(tp, opj_dwt97_decode_v_func, job);
             }
             opj_thread_pool_wait_completion(tp, 0);
+            if (!v_ret) {
+                opj_aligned_free(h.wavelet);
+                return OPJ_FALSE;
+            }
         }
 
         if (rw & (NB_ELTS_V8 - 1)) {

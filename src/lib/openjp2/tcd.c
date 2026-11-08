@@ -16,6 +16,7 @@
  * Copyright (c) 2012, CS Systemes d'Information, France
  * Copyright (c) 2017, IntoPIX SA <support@intopix.com>
  * Copyright (c) 2026, CtrlMovie AG
+ * Copyright (c) 2026, Mart Jansink
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -42,6 +43,11 @@
 
 #include "opj_includes.h"
 #include "opj_common.h"
+#include "dc_shift.h"
+#ifdef OPJ_USE_METAL
+#include <unistd.h> /* sysconf() */
+#include "opj_metal_t1_dec.h"
+#endif
 
 // #define DEBUG_RATE_ALLOC
 
@@ -979,6 +985,7 @@ OPJ_BOOL opj_alloc_tile_component_data(opj_tcd_tilecomp_t *l_tilec)
     if ((l_tilec->data == 00) ||
             ((l_tilec->data_size_needed > l_tilec->data_size) &&
              (l_tilec->ownsData == OPJ_FALSE))) {
+        l_tilec->data_gpu_mappable = OPJ_FALSE;
         l_tilec->data = (OPJ_INT32 *) opj_image_data_alloc(l_tilec->data_size_needed);
         if (!l_tilec->data && l_tilec->data_size_needed != 0) {
             return OPJ_FALSE;
@@ -989,6 +996,7 @@ OPJ_BOOL opj_alloc_tile_component_data(opj_tcd_tilecomp_t *l_tilec)
     } else if (l_tilec->data_size_needed > l_tilec->data_size) {
         /* We don't need to keep old data */
         opj_image_data_free(l_tilec->data);
+        l_tilec->data_gpu_mappable = OPJ_FALSE;
         l_tilec->data = (OPJ_INT32 *) opj_image_data_alloc(l_tilec->data_size_needed);
         if (! l_tilec->data) {
             l_tilec->data_size = 0;
@@ -1002,6 +1010,39 @@ OPJ_BOOL opj_alloc_tile_component_data(opj_tcd_tilecomp_t *l_tilec)
     }
     return OPJ_TRUE;
 }
+
+#ifdef OPJ_USE_METAL
+/* As opj_alloc_tile_component_data(), but page-aligned and a whole number */
+/* of pages, so that the Metal T1 decoder can map the plane and decode     */
+/* into it (zero-copy). The buffer stays freeable with                     */
+/* opj_image_data_free(), since that is free() with posix_memalign().      */
+/* Falls back to opj_alloc_tile_component_data(). */
+static OPJ_BOOL opj_alloc_tile_component_data_mappable(
+    opj_tcd_tilecomp_t *l_tilec)
+{
+#if defined(OPJ_HAVE_POSIX_MEMALIGN)
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    const size_t needed = l_tilec->data_size_needed;
+    void* p = NULL;
+    if (l_tilec->data && l_tilec->ownsData && l_tilec->data_gpu_mappable &&
+            needed <= l_tilec->data_size) {
+        return OPJ_TRUE;
+    }
+    if (needed != 0 && needed <= SIZE_MAX - page &&
+            posix_memalign(&p, page, (needed + page - 1) & ~(page - 1)) == 0) {
+        if (l_tilec->ownsData && l_tilec->data) {
+            opj_image_data_free(l_tilec->data);
+        }
+        l_tilec->data = (OPJ_INT32*)p;
+        l_tilec->data_size = (needed + page - 1) & ~(page - 1);
+        l_tilec->ownsData = OPJ_TRUE;
+        l_tilec->data_gpu_mappable = OPJ_TRUE;
+        return OPJ_TRUE;
+    }
+#endif
+    return opj_alloc_tile_component_data(l_tilec);
+}
+#endif
 
 /* ----------------------------------------------------------------------- */
 
@@ -1825,6 +1866,24 @@ OPJ_BOOL opj_tcd_decode_tile(opj_tcd_t *p_tcd,
 {
     OPJ_UINT32 l_data_read;
     OPJ_UINT32 compno;
+    /* OPJ_DEC_PROFILE=1: per tile stage wall times on stderr (fork) */
+    static int prof_env = -1;
+    OPJ_FLOAT64 prof_t[6] = { 0, 0, 0, 0, 0, 0 };
+    int prof;
+    if (prof_env < 0) {
+        prof_env = getenv("OPJ_DEC_PROFILE") != NULL ? 1 : 0;
+    }
+    prof = prof_env;
+    if (prof) {
+        prof_t[0] = opj_clock_wall();
+    }
+    p_tcd->prof_dec_busy = OPJ_FALSE;
+    p_tcd->dec_src_bytes = p_max_length;
+    p_tcd->prof_dec_pack = p_tcd->prof_dec_gpu = 0;
+    p_tcd->prof_dec_gpu_exec = p_tcd->prof_dec_scatter = 0;
+    p_tcd->prof_dec_cpu = p_tcd->prof_dec_gpu_wait = 0;
+    p_tcd->prof_dec_gpu_cblks = p_tcd->prof_dec_cpu_cblks = 0;
+    p_tcd->prof_dec_zero_copy = OPJ_FALSE;
 
     p_tcd->tcd_tileno = p_tile_no;
     p_tcd->tcp = &(p_tcd->cp->tcps[p_tile_no]);
@@ -1893,7 +1952,13 @@ OPJ_BOOL opj_tcd_decode_tile(opj_tcd_t *p_tcd,
 
             tilec->data_size_needed = l_data_size;
 
+#ifdef OPJ_USE_METAL
+            if (p_tcd->metal_t1 ?
+                    !opj_alloc_tile_component_data_mappable(tilec) :
+                    !opj_alloc_tile_component_data(tilec)) {
+#else
             if (!opj_alloc_tile_component_data(tilec)) {
+#endif
                 opj_event_msg(p_manager, EVT_ERROR,
                               "Size of tile data exceeds system limits\n");
                 return OPJ_FALSE;
@@ -1982,6 +2047,9 @@ OPJ_BOOL opj_tcd_decode_tile(opj_tcd_t *p_tcd,
         return OPJ_FALSE;
     }
     /* FIXME _ProfStop(PGROUP_T2); */
+    if (prof) {
+        prof_t[1] = opj_clock_wall();
+    }
 
     /*------------------TIER1-----------------*/
 
@@ -1990,6 +2058,9 @@ OPJ_BOOL opj_tcd_decode_tile(opj_tcd_t *p_tcd,
         return OPJ_FALSE;
     }
     /* FIXME _ProfStop(PGROUP_T1); */
+    if (prof) {
+        prof_t[2] = opj_clock_wall();
+    }
 
 
     /* For subtile decoding, now we know the resno_decoded, we can allocate */
@@ -2042,21 +2113,63 @@ OPJ_BOOL opj_tcd_decode_tile(opj_tcd_t *p_tcd,
         return OPJ_FALSE;
     }
     /* FIXME _ProfStop(PGROUP_DWT); */
-
-    /*----------------MCT-------------------*/
-    /* FIXME _ProfStart(PGROUP_MCT); */
-    if
-    (! opj_tcd_mct_decode(p_tcd, p_manager)) {
-        return OPJ_FALSE;
+    if (prof) {
+        prof_t[3] = opj_clock_wall();
     }
-    /* FIXME _ProfStop(PGROUP_MCT); */
 
-    /* FIXME _ProfStart(PGROUP_DC_SHIFT); */
-    if
-    (! opj_tcd_dc_level_shift_decode(p_tcd)) {
-        return OPJ_FALSE;
+    /* With OUTPUT_MCT_DOMAIN=YES the caller applies the inverse MCT and the
+     * DC level shift itself (see the contract in openjpeg.h): the planes
+     * keep the output of the inverse DWT. */
+    if (!p_tcd->output_mct_domain) {
+        /*----------------MCT-------------------*/
+        /* FIXME _ProfStart(PGROUP_MCT); */
+        if
+        (! opj_tcd_mct_decode(p_tcd, p_manager)) {
+            return OPJ_FALSE;
+        }
+        /* FIXME _ProfStop(PGROUP_MCT); */
+        if (prof) {
+            prof_t[4] = opj_clock_wall();
+        }
+
+        /* FIXME _ProfStart(PGROUP_DC_SHIFT); */
+        if
+        (! opj_tcd_dc_level_shift_decode(p_tcd)) {
+            return OPJ_FALSE;
+        }
+        /* FIXME _ProfStop(PGROUP_DC_SHIFT); */
+    } else if (prof) {
+        prof_t[4] = opj_clock_wall();
     }
-    /* FIXME _ProfStop(PGROUP_DC_SHIFT); */
+
+    if (prof) {
+        prof_t[5] = opj_clock_wall();
+        fprintf(stderr,
+                "opj_dec_profile: tile %u (ms): t2 %.1f, t1 %.1f, dwt %.1f, "
+                "mct %.1f, dc_shift %.1f, total %.1f\n",
+                p_tile_no, 1e3 * (prof_t[1] - prof_t[0]),
+                1e3 * (prof_t[2] - prof_t[1]), 1e3 * (prof_t[3] - prof_t[2]),
+                1e3 * (prof_t[4] - prof_t[3]), 1e3 * (prof_t[5] - prof_t[4]),
+                1e3 * (prof_t[5] - prof_t[0]));
+        if (p_tcd->metal_t1 && p_tcd->prof_dec_share == -1) {
+            fprintf(stderr, "opj_dec_profile:   metal t1: split chose the CPU "
+                    "only\n");
+        } else if (p_tcd->metal_t1 && p_tcd->prof_dec_busy) {
+            fprintf(stderr, "opj_dec_profile:   metal t1: GPU busy, tile decoded "
+                    "on the CPU\n");
+        } else if (p_tcd->metal_t1) {
+            fprintf(stderr,
+                    "opj_dec_profile:   metal t1 (ms, cpu share %d%%): pack %.1f, "
+                    "gpu %.1f (exec %.1f), cpu during gpu %.1f, gpu wait %.1f, "
+                    "fallback+scatter %.1f; %u gpu / %u cpu code-blocks%s\n",
+                    p_tcd->prof_dec_share, 1e3 * p_tcd->prof_dec_pack,
+                    1e3 * p_tcd->prof_dec_gpu, 1e3 * p_tcd->prof_dec_gpu_exec,
+                    1e3 * p_tcd->prof_dec_cpu, 1e3 * p_tcd->prof_dec_gpu_wait,
+                    1e3 * p_tcd->prof_dec_scatter, p_tcd->prof_dec_gpu_cblks,
+                    p_tcd->prof_dec_cpu_cblks,
+                    p_tcd->prof_dec_zero_copy ? ", zero-copy" : "");
+        }
+    }
 
 
     /*---------------TILE-------------------*/
@@ -2256,6 +2369,7 @@ static void opj_tcd_free_tile(opj_tcd_t *p_tcd)
         if (l_tile_comp->ownsData && l_tile_comp->data) {
             opj_image_data_free(l_tile_comp->data);
             l_tile_comp->data = 00;
+            l_tile_comp->data_gpu_mappable = OPJ_FALSE;
             l_tile_comp->ownsData = 0;
             l_tile_comp->data_size = 0;
             l_tile_comp->data_size_needed = 0;
@@ -2317,6 +2431,13 @@ static OPJ_BOOL opj_tcd_t1_decode(opj_tcd_t *p_tcd, opj_event_mgr_t *p_manager)
     volatile OPJ_BOOL ret = OPJ_TRUE;
     OPJ_BOOL check_pterm = OPJ_FALSE;
     opj_mutex_t* p_manager_mutex = NULL;
+#ifdef OPJ_USE_METAL
+    OPJ_UINT32 split_key = 0;
+    int split_cand = -1;
+    OPJ_BOOL split_measure = OPJ_FALSE;
+    OPJ_BOOL on_gpu = OPJ_FALSE;
+    OPJ_FLOAT64 t_start;
+#endif
 
     p_manager_mutex = opj_mutex_create();
 
@@ -2326,7 +2447,27 @@ static OPJ_BOOL opj_tcd_t1_decode(opj_tcd_t *p_tcd, opj_event_mgr_t *p_manager)
         check_pterm = OPJ_TRUE;
     }
 
-    for (compno = 0; compno < l_tile->numcomps;
+#ifdef OPJ_USE_METAL
+    /* the first call compiles the kernels: keep that out of the timing */
+    if (p_tcd->metal_t1) {
+        (void)opj_metal_t1_dec_available();
+    }
+    t_start = opj_clock_wall();
+    p_tcd->prof_dec_share = -2;
+    if (p_tcd->metal_t1) {
+        const int share = opj_t1_dec_split_choose(p_tcd, &split_key, &split_cand,
+                                                  &split_measure);
+        p_tcd->prof_dec_share = share;
+        on_gpu = share >= 0 &&
+                 opj_t1_decode_cblks_metal(p_tcd, &ret, p_manager, p_manager_mutex,
+                                           check_pterm, (OPJ_UINT32)share);
+    }
+    if (on_gpu) {
+        compno = l_tile->numcomps; /* skip the CPU loop */
+    } else
+#endif
+        compno = 0;
+    for (; compno < l_tile->numcomps;
             ++compno, ++l_tile_comp, ++l_tccp) {
         if (p_tcd->used_component != NULL && !p_tcd->used_component[compno]) {
             continue;
@@ -2340,6 +2481,17 @@ static OPJ_BOOL opj_tcd_t1_decode(opj_tcd_t *p_tcd, opj_event_mgr_t *p_manager)
     }
 
     opj_thread_pool_wait_completion(p_tcd->thread_pool, 0);
+#ifdef OPJ_USE_METAL
+    /* Only times of the chosen split count: not those of tiles that found */
+    /* the GPU busy or had nothing for it */
+    if (ret && split_cand >= 0 && (on_gpu || p_tcd->prof_dec_share < 0)) {
+        /* per coded megabyte, so that frames of different weight compare */
+        opj_t1_dec_split_report(split_key, split_cand,
+                                (opj_clock_wall() - t_start) * 1e6 /
+                                (OPJ_FLOAT64)opj_uint_max(p_tcd->dec_src_bytes, 1),
+                                split_measure);
+    }
+#endif
     if (p_manager_mutex) {
         opj_mutex_destroy(p_manager_mutex);
     }
@@ -2529,18 +2681,61 @@ static OPJ_BOOL opj_tcd_mct_decode(opj_tcd_t *p_tcd, opj_event_mgr_t *p_manager)
 }
 
 
+typedef struct {
+    OPJ_INT32* p;
+    OPJ_UINT32 width;
+    OPJ_UINT32 rows;
+    OPJ_UINT32 row_stride;
+    OPJ_INT32 shift;
+    OPJ_INT32 min;
+    OPJ_INT32 max;
+    OPJ_BOOL is_float;
+} opj_tcd_dc_shift_job_t;
+
+static void opj_tcd_dc_shift_rows(const opj_tcd_dc_shift_job_t* job)
+{
+    OPJ_UINT32 j;
+    OPJ_INT32* p = job->p;
+    for (j = 0; j < job->rows; ++j, p += job->row_stride) {
+        if (job->is_float) {
+            opj_dc_shift_row_float(p, job->width, job->shift, job->min, job->max);
+        } else {
+            opj_dc_shift_row_int(p, job->width, job->shift, job->min, job->max);
+        }
+    }
+}
+
+static void opj_tcd_dc_shift_job(void* user_data, opj_tls_t* tls)
+{
+    (void)tls;
+    opj_tcd_dc_shift_rows((const opj_tcd_dc_shift_job_t*)user_data);
+    opj_free(user_data);
+}
+
 static OPJ_BOOL opj_tcd_dc_level_shift_decode(opj_tcd_t *p_tcd)
 {
+    /* OPJ_DEC_SCALAR_DC_SHIFT=1: scalar and single-threaded, as upstream */
+    static int scalar_env = -1;
+    OPJ_BOOL scalar;
+    opj_thread_pool_t* tp = p_tcd->thread_pool;
+    OPJ_UINT32 nthreads;
     OPJ_UINT32 compno;
     opj_tcd_tilecomp_t * l_tile_comp = 00;
     opj_tccp_t * l_tccp = 00;
     opj_image_comp_t * l_img_comp = 00;
     opj_tcd_resolution_t* l_res = 00;
     opj_tcd_tile_t * l_tile;
-    OPJ_UINT32 l_width, l_height, i, j;
+    OPJ_UINT32 l_width, l_height, j;
     OPJ_INT32 * l_current_ptr;
     OPJ_INT32 l_min, l_max;
     OPJ_UINT32 l_stride;
+
+    if (scalar_env < 0) {
+        const char* env = getenv("OPJ_DEC_SCALAR_DC_SHIFT");
+        scalar_env = (env && atoi(env) != 0) ? 1 : 0;
+    }
+    scalar = scalar_env ? OPJ_TRUE : OPJ_FALSE;
+    nthreads = scalar ? 1U : (OPJ_UINT32)opj_thread_pool_get_thread_count(tp);
 
     l_tile = p_tcd->tcd_image->tiles;
     l_tile_comp = l_tile->comps;
@@ -2586,35 +2781,58 @@ static OPJ_BOOL opj_tcd_dc_level_shift_decode(opj_tcd_t *p_tcd)
             continue;
         }
 
-        if (l_tccp->qmfbid == 1) {
+        if (scalar) {
+            /* Row by row with the scalar kernels, for A/B comparisons */
             for (j = 0; j < l_height; ++j) {
-                for (i = 0; i < l_width; ++i) {
-                    /* TODO: do addition on int64 ? */
-                    *l_current_ptr = opj_int_clamp(*l_current_ptr + l_tccp->m_dc_level_shift, l_min,
-                                                   l_max);
-                    ++l_current_ptr;
+                if (l_tccp->qmfbid == 1) {
+                    opj_dc_shift_row_int_scalar(l_current_ptr, l_width,
+                                                l_tccp->m_dc_level_shift, l_min, l_max);
+                } else {
+                    opj_dc_shift_row_float_scalar(l_current_ptr, l_width,
+                                                  l_tccp->m_dc_level_shift, l_min, l_max);
                 }
-                l_current_ptr += l_stride;
+                l_current_ptr += l_width + l_stride;
+            }
+            continue;
+        }
+
+        if (nthreads > 1 && (OPJ_UINT64)l_width * l_height >= 65536) {
+            /* Bands of rows, a few per thread for balance */
+            const OPJ_UINT32 nbands = opj_uint_min(l_height, nthreads * 2);
+            const OPJ_UINT32 band = (l_height + nbands - 1) / nbands;
+            for (j = 0; j < l_height; j += band) {
+                opj_tcd_dc_shift_job_t* job = (opj_tcd_dc_shift_job_t*)opj_malloc(
+                                                  sizeof(*job));
+                if (!job) {
+                    opj_thread_pool_wait_completion(tp, 0);
+                    return OPJ_FALSE;
+                }
+                job->p = l_current_ptr + (OPJ_SIZE_T)j * (l_width + l_stride);
+                job->width = l_width;
+                job->rows = opj_uint_min(band, l_height - j);
+                job->row_stride = l_width + l_stride;
+                job->shift = l_tccp->m_dc_level_shift;
+                job->min = l_min;
+                job->max = l_max;
+                job->is_float = l_tccp->qmfbid != 1;
+                opj_thread_pool_submit_job(tp, opj_tcd_dc_shift_job, job);
             }
         } else {
-            for (j = 0; j < l_height; ++j) {
-                for (i = 0; i < l_width; ++i) {
-                    OPJ_FLOAT32 l_value = *((OPJ_FLOAT32 *) l_current_ptr);
-                    if (l_value > (OPJ_FLOAT32)INT_MAX) {
-                        *l_current_ptr = l_max;
-                    } else if (l_value < INT_MIN) {
-                        *l_current_ptr = l_min;
-                    } else {
-                        /* Do addition on int64 to avoid overflows */
-                        OPJ_INT64 l_value_int = (OPJ_INT64)opj_lrintf(l_value);
-                        *l_current_ptr = (OPJ_INT32)opj_int64_clamp(
-                                             l_value_int + l_tccp->m_dc_level_shift, l_min, l_max);
-                    }
-                    ++l_current_ptr;
-                }
-                l_current_ptr += l_stride;
-            }
+            opj_tcd_dc_shift_job_t job;
+            job.p = l_current_ptr;
+            job.width = l_width;
+            job.rows = l_height;
+            job.row_stride = l_width + l_stride;
+            job.shift = l_tccp->m_dc_level_shift;
+            job.min = l_min;
+            job.max = l_max;
+            job.is_float = l_tccp->qmfbid != 1;
+            opj_tcd_dc_shift_rows(&job);
         }
+    }
+
+    if (nthreads > 1) {
+        opj_thread_pool_wait_completion(tp, 0);
     }
 
     return OPJ_TRUE;

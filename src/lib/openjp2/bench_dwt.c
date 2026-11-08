@@ -5,6 +5,7 @@
  * are granted under this license.
  *
  * Copyright (c) 2017, IntoPix SA <contact@intopix.com>
+ * Copyright (c) 2026, Mart Jansink
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -110,6 +111,13 @@ void usage(void)
         "bench_dwt [-decode|encode] [-I] [-size value] [-check] [-display]\n");
     printf(
         "          [-num_resolutions val] [-offset x y] [-num_threads val]\n");
+    printf(
+        "          [-width val] [-height val] [-iter val] [-hash]\n");
+    printf("\n");
+    printf("-width/-height: non-square tile (default: -size for both).\n");
+    printf("-iter: run the transform this many times on the same input and\n");
+    printf("       report the median wall-clock time.\n");
+    printf("-hash: print a hash of the output, to compare builds.\n");
     exit(1);
 }
 
@@ -172,6 +180,12 @@ int main(int argc, char** argv)
     OPJ_UINT32 num_resolutions = 6;
     OPJ_BOOL bench_decode = OPJ_TRUE;
     OPJ_BOOL irreversible = OPJ_FALSE;
+    OPJ_INT32 width = -1, height = -1;
+    OPJ_INT32 iter = 1, it;
+    OPJ_BOOL hash = OPJ_FALSE;
+    OPJ_INT32* input = NULL;
+    OPJ_FLOAT64* times = NULL;
+    size_t nValues;
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-encode") == 0) {
@@ -187,6 +201,20 @@ int main(int argc, char** argv)
         } else if (strcmp(argv[i], "-size") == 0 && i + 1 < argc) {
             size = atoi(argv[i + 1]);
             i ++;
+        } else if (strcmp(argv[i], "-width") == 0 && i + 1 < argc) {
+            width = atoi(argv[i + 1]);
+            i ++;
+        } else if (strcmp(argv[i], "-height") == 0 && i + 1 < argc) {
+            height = atoi(argv[i + 1]);
+            i ++;
+        } else if (strcmp(argv[i], "-iter") == 0 && i + 1 < argc) {
+            iter = atoi(argv[i + 1]);
+            if (iter < 1) {
+                iter = 1;
+            }
+            i ++;
+        } else if (strcmp(argv[i], "-hash") == 0) {
+            hash = OPJ_TRUE;
         } else if (strcmp(argv[i], "-num_threads") == 0 && i + 1 < argc) {
             num_threads = atoi(argv[i + 1]);
             i ++;
@@ -214,11 +242,29 @@ int main(int argc, char** argv)
         exit(1);
     }
 
+    if (width < 0) {
+        width = size;
+    }
+    if (height < 0) {
+        height = size;
+    }
+    if (iter > 1 && check) {
+        printf("-iter and -check aren't compatible\n");
+        exit(1);
+    }
+
     tp = opj_thread_pool_create(num_threads);
 
     init_tilec(&tilec, (OPJ_INT32)offset_x, (OPJ_INT32)offset_y,
-               (OPJ_INT32)offset_x + size, (OPJ_INT32)offset_y + size,
+               (OPJ_INT32)offset_x + width, (OPJ_INT32)offset_y + height,
                num_resolutions, irreversible);
+    nValues = (size_t)width * (size_t)height;
+    if (iter > 1) {
+        input = (OPJ_INT32*)opj_malloc(nValues * sizeof(OPJ_INT32));
+        times = (OPJ_FLOAT64*)opj_malloc((size_t)iter * sizeof(OPJ_FLOAT64));
+        assert(input != NULL && times != NULL);
+        memcpy(input, tilec.data, nValues * sizeof(OPJ_INT32));
+    }
 
     if (display) {
         printf("Before\n");
@@ -261,27 +307,59 @@ int main(int argc, char** argv)
     image_comp.dx = 1;
     image_comp.dy = 1;
 
-    start = opj_clock();
-    start_wc = opj_wallclock();
-    if (bench_decode) {
-        if (irreversible)  {
-            opj_dwt_decode_real(&tcd, &tilec, tilec.numresolutions);
-        } else {
-            opj_dwt_decode(&tcd, &tilec, tilec.numresolutions);
+    for (it = 0; it < iter; it++) {
+        if (it > 0) {
+            memcpy(tilec.data, input, nValues * sizeof(OPJ_INT32));
         }
-    } else {
-        if (irreversible)  {
-            opj_dwt_encode_real(&tcd, &tilec);
+        start = opj_clock();
+        start_wc = opj_wallclock();
+        if (bench_decode) {
+            if (irreversible)  {
+                opj_dwt_decode_real(&tcd, &tilec, tilec.numresolutions);
+            } else {
+                opj_dwt_decode(&tcd, &tilec, tilec.numresolutions);
+            }
         } else {
-            opj_dwt_encode(&tcd, &tilec);
+            if (irreversible)  {
+                opj_dwt_encode_real(&tcd, &tilec);
+            } else {
+                opj_dwt_encode(&tcd, &tilec);
+            }
+        }
+        stop = opj_clock();
+        stop_wc = opj_wallclock();
+        if (iter == 1) {
+            printf("time for %s: total = %.03f s, wallclock = %.03f s\n",
+                   bench_decode ? "dwt_decode" : "dwt_encode",
+                   stop - start,
+                   stop_wc - start_wc);
+        } else {
+            OPJ_INT32 m;
+            /* insertion sort: iter is small */
+            for (m = it; m > 0 && times[m - 1] > stop_wc - start_wc; m--) {
+                times[m] = times[m - 1];
+            }
+            times[m] = stop_wc - start_wc;
         }
     }
-    stop = opj_clock();
-    stop_wc = opj_wallclock();
-    printf("time for %s: total = %.03f s, wallclock = %.03f s\n",
-           bench_decode ? "dwt_decode" : "dwt_encode",
-           stop - start,
-           stop_wc - start_wc);
+    if (iter > 1) {
+        printf("time for %s %dx%d: median of %d = %.03f ms, min = %.03f ms\n",
+               bench_decode ? "dwt_decode" : "dwt_encode",
+               width, height, iter, times[iter / 2] * 1e3, times[0] * 1e3);
+        opj_free(times);
+        opj_free(input);
+    }
+
+    if (hash) {
+        /* FNV-1a over the output bytes */
+        OPJ_UINT64 hv = 1469598103934665603ULL;
+        const unsigned char* bytes = (const unsigned char*)tilec.data;
+        size_t b;
+        for (b = 0; b < nValues * sizeof(OPJ_INT32); b++) {
+            hv = (hv ^ bytes[b]) * 1099511628211ULL;
+        }
+        printf("hash = %016llx\n", (unsigned long long)hv);
+    }
 
     if (display) {
         if (bench_decode) {
@@ -337,8 +415,6 @@ int main(int argc, char** argv)
     if (check) {
 
         size_t idx;
-        size_t nValues = (size_t)(tilec.x1 - tilec.x0) *
-                         (size_t)(tilec.y1 - tilec.y0);
         for (idx = 0; idx < nValues; idx++) {
             if (tilec.data[idx] != getValue((OPJ_UINT32)idx)) {
                 printf("Difference found at idx = %u\n", (OPJ_UINT32)idx);

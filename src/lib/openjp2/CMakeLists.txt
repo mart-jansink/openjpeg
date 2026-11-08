@@ -1,4 +1,5 @@
 # Copyright (c) 2026, CtrlMovie AG
+# Copyright (c) 2026, Mart Jansink
 include_regular_expression("^.*$")
 
 #
@@ -202,6 +203,18 @@ if(BUILD_UNIT_TESTS AND UNIX)
     endif()
     if(OPJ_USE_THREAD AND CMAKE_USE_PTHREADS_INIT)
         target_link_libraries(bench_encode ${CMAKE_THREAD_LIBS_INIT})
+    endif()
+    # bench_decode: GPU tier-1 decoder verifier and decode benchmark (fork).
+    # -ffast-math as the library in Release, so that its host reference of
+    # the inverse MCT rounds like mct.c.
+    add_executable(bench_decode bench_decode.c)
+    target_link_libraries(bench_decode ${OPENJPEG_LIBRARY_NAME})
+    target_compile_options(bench_decode PRIVATE "$<$<CONFIG:Release>:-ffast-math>")
+    if(UNIX)
+        target_link_libraries(bench_decode m)
+    endif()
+    if(OPJ_USE_THREAD AND CMAKE_USE_PTHREADS_INIT)
+        target_link_libraries(bench_decode ${CMAKE_THREAD_LIBS_INIT})
     endif()
     add_executable(bench_dwt bench_dwt.c)
     if(UNIX)

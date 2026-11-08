@@ -17,6 +17,7 @@
  * Copyright (c) 2012, CS Systemes d'Information, France
  *
  * Copyright (c) 2026, CtrlMovie AG
+ * Copyright (c) 2026, Mart Jansink
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -546,6 +547,13 @@ typedef struct opj_j2k_dec {
     OPJ_BITFIELD m_nb_tile_parts_correction_checked : 1;
     OPJ_BITFIELD m_nb_tile_parts_correction : 1;
 
+    /** METAL_T1 decoder option: 0 not set (the OPJ_METAL_T1_DECODE
+     * environment variable decides), 1 NO, 2 YES. Fork extension. */
+    OPJ_UINT32 m_metal_t1;
+    /** OUTPUT_MCT_DOMAIN=YES: skip the inverse MCT and the DC level shift,
+     * the output planes hold the inverse DWT output. Fork extension. */
+    OPJ_BOOL m_output_mct_domain;
+
 } opj_j2k_dec_t;
 
 typedef struct opj_j2k_enc {
@@ -904,6 +912,20 @@ OPJ_BOOL opj_j2k_get_tile(opj_j2k_t *p_j2k,
 OPJ_BOOL opj_j2k_set_decoded_resolution_factor(opj_j2k_t *p_j2k,
         OPJ_UINT32 res_factor,
         opj_event_mgr_t * p_manager);
+
+/**
+ * Specify extra options for the decoder (fork extension).
+ *
+ * @param  p_j2k        the jpeg2000 codec.
+ * @param  p_options    options
+ * @param  p_manager    the user event manager
+ *
+ * @see opj_decoder_set_extra_options() for more details.
+ */
+OPJ_BOOL opj_j2k_decoder_set_extra_options(
+    opj_j2k_t *p_j2k,
+    const char* const* p_options,
+    opj_event_mgr_t * p_manager);
 
 /**
  * Specify extra options for the encoder.

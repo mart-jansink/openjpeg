@@ -1,4 +1,5 @@
 /* Copyright (c) 2026, CtrlMovie AG */
+/* Copyright (c) 2026, Mart Jansink */
 #ifndef OPJ_CONFIG_H_INCLUDED
 #define OPJ_CONFIG_H_INCLUDED
 
@@ -18,5 +19,10 @@
 /* Defined when the library is built with the Metal GPU tier-1 encoder
  * (OPJ_USE_METAL=ON), i.e. when the METAL_T1=YES encoder option is effective. */
 #cmakedefine OPJ_HAVE_METAL_T1
+
+/* Defined when the library is built with the Metal GPU tier-1 decoder
+ * (OPJ_USE_METAL=ON), i.e. when the METAL_T1=YES decoder option
+ * (opj_decoder_set_extra_options()) is effective. */
+#cmakedefine OPJ_HAVE_METAL_T1_DECODE
 
 #endif

@@ -15,6 +15,7 @@
  * Copyright (c) 2008, 2011-2012, Centre National d'Etudes Spatiales (CNES), FR
  * Copyright (c) 2012, CS Systemes d'Information, France
  * Copyright (c) 2026, CtrlMovie AG
+ * Copyright (c) 2026, Mart Jansink
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -3229,6 +3230,25 @@ OPJ_BOOL opj_jp2_encoder_set_extra_options(
     opj_event_mgr_t * p_manager)
 {
     return opj_j2k_encoder_set_extra_options(p_jp2->j2k, p_options, p_manager);
+}
+
+OPJ_BOOL opj_jp2_decoder_set_extra_options(
+    opj_jp2_t *p_jp2,
+    const char* const* p_options,
+    opj_event_mgr_t * p_manager)
+{
+    const char* const* p_option_iter;
+    if (p_options) {
+        for (p_option_iter = p_options; *p_option_iter != NULL; ++p_option_iter) {
+            if (strcmp(*p_option_iter, "OUTPUT_MCT_DOMAIN=YES") == 0) {
+                opj_event_msg(p_manager, EVT_ERROR,
+                              "OUTPUT_MCT_DOMAIN=YES is not supported for JP2 files; "
+                              "decode the codestream with OPJ_CODEC_J2K.\n");
+                return OPJ_FALSE;
+            }
+        }
+    }
+    return opj_j2k_decoder_set_extra_options(p_jp2->j2k, p_options, p_manager);
 }
 
 /* ----------------------------------------------------------------------- */

@@ -17,6 +17,7 @@
 * Copyright (c) 2010-2011, Kaori Hagihara
 * Copyright (c) 2011-2012, Centre National d'Etudes Spatiales (CNES), France
 * Copyright (c) 2012, CS Systemes d'Information, France
+* Copyright (c) 2026, Mart Jansink
 * All rights reserved.
 *
 * Redistribution and use in source and binary forms, with or without
@@ -1422,6 +1423,67 @@ OPJ_API OPJ_BOOL OPJ_CALLCONV opj_setup_decoder(opj_codec_t *p_codec,
 
 OPJ_API OPJ_BOOL OPJ_CALLCONV opj_decoder_set_strict_mode(opj_codec_t *p_codec,
         OPJ_BOOL strict);
+
+/**
+ * Specify extra options for the decoder (fork extension, not part of
+ * upstream OpenJPEG).
+ *
+ * This may be called after opj_setup_decoder() and before opj_decode() or
+ * opj_get_decoded_tile().
+ *
+ * Currently supported options are:
+ * <ul>
+ * <li>METAL_T1=YES/NO. Decodes the tier-1 code-blocks on the GPU (Apple
+ *     Metal) when the library is built with OPJ_USE_METAL
+ *     (OPJ_HAVE_METAL_T1_DECODE in opj_config.h); ignored with a warning
+ *     otherwise. The decoded image is bit-identical to the CPU path.
+ *     Code-blocks the GPU does not support (code-block style other than 0,
+ *     ROI shift, HT, sides above 64) and GPU failures fall back to the CPU.
+ *     When the option is not given, the environment variable
+ *     OPJ_METAL_T1_DECODE=1 enables it (the encoder's OPJ_METAL_T1 does
+ *     not). Several decoders in one process share the GPU; a decoder never
+ *     waits for it: when the GPU is busy with other decoders' tiles, the
+ *     tile is decoded on the CPU. How the code-blocks of a tile are split
+ *     between the CPU and the GPU is chosen by measuring decode times.</li>
+ * <li>OUTPUT_MCT_DOMAIN=YES/NO. Defaults to NO. Only for OPJ_CODEC_J2K
+ *     (rejected for JP2). The decoder skips its inverse multi-component
+ *     transform and DC level shift stages, so that the caller can apply
+ *     them (for example in a GPU kernel). image->comps[c].data then holds
+ *     the output of the inverse DWT, without clamping to the precision:
+ *     <ul>
+ *     <li>Irreversible (9/7, qmfbid 0, e.g. the Cinema profiles): each
+ *         OPJ_INT32 slot holds the bit pattern of an OPJ_FLOAT32. To get the
+ *         samples of the normal decode, apply, when the MCT is signalled
+ *         (COD) and there are 3+ components, to the first 3 components
+ *         (y=c0, u=c1, v=c2):
+ *         r = y + (v * 1.402f),
+ *         g = y - (u * 0.34413f) - (v * 0.71414f),
+ *         b = y + (u * 1.772f) (float32; the arm64 Release build with
+ *         -ffast-math may contract these into FMAs), then per component
+ *         sample = clamp(lrintf(value) + dc_shift_c, min_c, max_c) with
+ *         dc_shift_c = 1 << (prec_c - 1) for unsigned components and 0
+ *         for signed ones, min/max the range of prec_c bits.</li>
+ *     <li>Reversible (5/3, qmfbid 1): plain OPJ_INT32. With the MCT:
+ *         g = y - ((u + v) >> 2), r = v + g, b = u + g; then
+ *         sample = clamp(value + dc_shift_c, min_c, max_c).</li>
+ *     </ul>
+ *     A custom MCT (MCT/MCC markers) is skipped as well. Components not
+ *     decoded (opj_set_decoded_components()) never get the MCT anyway.</li>
+ * </ul>
+ *
+ * @param p_codec       decompressor handle
+ * @param p_options     options, NULL terminated list of strings, or NULL
+ *
+ * @return OPJ_TRUE in case of success, OPJ_FALSE on an unknown option or
+ *         an invalid value.
+ */
+OPJ_API OPJ_BOOL OPJ_CALLCONV opj_decoder_set_extra_options(
+    opj_codec_t *p_codec,
+    const char* const* p_options);
+
+/** Feature-test macro: this library provides
+ * opj_decoder_set_extra_options() (fork extension). */
+#define OPJ_HAVE_DECODER_EXTRA_OPTIONS 1
 
 /**
  * Allocates worker threads for the compressor/decompressor.

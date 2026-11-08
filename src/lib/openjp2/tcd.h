@@ -15,6 +15,7 @@
  * Copyright (c) 2012, CS Systemes d'Information, France
  * Copyright (c) 2017, IntoPIX SA <support@intopix.com>
  * Copyright (c) 2026, CtrlMovie AG
+ * Copyright (c) 2026, Mart Jansink
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -219,6 +220,11 @@ typedef struct opj_tcd_tilecomp {
     OPJ_INT32 *data;
     /* if true, then need to free after usage, otherwise do not free */
     OPJ_BOOL  ownsData;
+    /* Decoder, fork extension: data was allocated page-aligned with a size
+     * rounded up to whole pages (opj_alloc_tile_component_data_mappable()
+     * in tcd.c), so the GPU tier-1 decoder may map it as an MTLBuffer
+     * without copying. */
+    OPJ_BOOL  data_gpu_mappable;
     /* we may either need to allocate this amount of data, or re-use image data and ignore this value */
     size_t data_size_needed;
     /* size of the data of the component */
@@ -304,9 +310,29 @@ typedef struct opj_tcd {
      * already DC level shifted and MCT transformed (INPUT_MCT_DOMAIN=YES),
      * so opj_tcd_encode_tile() skips those two stages. */
     OPJ_BOOL   input_mct_domain;
-    /** Only valid for encoding. Encode the code-blocks on the GPU when the
-     * library is built with OPJ_USE_METAL (METAL_T1=YES or OPJ_METAL_T1=1). */
+    /** Encode (METAL_T1=YES or OPJ_METAL_T1=1) or decode (decoder option
+     * METAL_T1=YES or OPJ_METAL_T1_DECODE=1) the code-blocks on the GPU when
+     * the library is built with OPJ_USE_METAL. */
     OPJ_BOOL   metal_t1;
+    /** Only valid for decoding. OUTPUT_MCT_DOMAIN=YES: opj_tcd_decode_tile()
+     * skips the inverse MCT and the DC level shift. */
+    OPJ_BOOL   output_mct_domain;
+    /** Only valid for decoding: coded bytes of the tile being decoded */
+    OPJ_UINT32  dec_src_bytes;
+    /** OPJ_DEC_PROFILE timers of the last opj_t1_decode_cblks_metal() run,
+     * in seconds, and its code-block counts. */
+    OPJ_BOOL    prof_dec_busy;    /* GPU busy: the tile went to the CPU */
+    OPJ_INT32   prof_dec_share;   /* chosen CPU share, -1 CPU only, -2 none */
+    OPJ_FLOAT64 prof_dec_pack;    /* enumeration and input packing */
+    OPJ_FLOAT64 prof_dec_gpu;     /* GPU run, commit to the end of the wait */
+    OPJ_FLOAT64 prof_dec_gpu_exec; /* GPU run, GPUStartTime..GPUEndTime */
+    OPJ_FLOAT64 prof_dec_cpu;     /* CPU code-blocks during the GPU run */
+                                  /* (submission, or decoding without pool) */
+    OPJ_FLOAT64 prof_dec_gpu_wait; /* waiting for the GPU after that */
+    OPJ_FLOAT64 prof_dec_scatter; /* CPU fallback wait, copy to the tile */
+    OPJ_UINT32  prof_dec_gpu_cblks;
+    OPJ_UINT32  prof_dec_cpu_cblks;
+    OPJ_BOOL    prof_dec_zero_copy;
     /** OPJ_ENC_PROFILE timers of the last opj_t1_encode_cblks() Metal path,
      * in seconds: quantisation, GPU batch (wait), scatter, CPU fallback. */
     OPJ_FLOAT64 prof_t1_wait;  /* waiting for a free GPU batch */

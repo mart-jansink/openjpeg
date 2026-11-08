@@ -6,6 +6,7 @@
  *
  * Copyright (c) 2002-2014, Universite catholique de Louvain (UCL), Belgium
  * Copyright (c) 2002-2014, Professor Benoit Macq
+ * Copyright (c) 2026, Mart Jansink
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -119,6 +120,11 @@ typedef struct opj_codec_private {
                                                   OPJ_UINT32 num_comps,
                                                   const OPJ_UINT32* comps_indices,
                                                   opj_event_mgr_t * p_manager);
+
+            /** Set decoder extra options (fork extension) */
+            OPJ_BOOL(*opj_decoder_set_extra_options)(void * p_codec,
+                    const char* const* p_options,
+                    struct opj_event_mgr * p_manager);
         } m_decompression;
 
         /**

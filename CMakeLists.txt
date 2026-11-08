@@ -1,4 +1,5 @@
 # Copyright (c) 2026, CtrlMovie AG
+# Copyright (c) 2026, Mart Jansink
 # Main CMakeLists.txt to build the OpenJPEG project using CMake (www.cmake.org)
 # Written by Mathieu Malaterre
 
@@ -223,10 +224,11 @@ if(BUILD_JPIP_SERVER)
   endif()
 endif()
 if(APPLE)
-option(OPJ_USE_METAL "Build the experimental Metal (Apple GPU) T1 encoder prototype" OFF)
+option(OPJ_USE_METAL "Build the Metal (Apple GPU) T1 encoder and decoder" OFF)
 if(OPJ_USE_METAL)
   enable_language(OBJC)
   set(OPJ_HAVE_METAL_T1 ON) # opj_config.h
+  set(OPJ_HAVE_METAL_T1_DECODE ON) # opj_config.h
 endif()
 endif()
 add_subdirectory(src/lib)

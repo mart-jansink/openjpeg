@@ -10,6 +10,7 @@
  * Copyright (c) 2005, Herve Drolon, FreeImage Team
  * Copyright (c) 2008, 2011-2012, Centre National d'Etudes Spatiales (CNES), FR
  * Copyright (c) 2012, CS Systemes d'Information, France
+ * Copyright (c) 2026, Mart Jansink
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -478,6 +479,17 @@ OPJ_BOOL opj_jp2_set_decoded_resolution_factor(opj_jp2_t *p_jp2,
  * @see opj_encoder_set_extra_options() for more details.
  */
 OPJ_BOOL opj_jp2_encoder_set_extra_options(
+    opj_jp2_t *p_jp2,
+    const char* const* p_options,
+    opj_event_mgr_t * p_manager);
+
+/**
+ * Specify extra options for the decoder (fork extension). OUTPUT_MCT_DOMAIN
+ * is rejected for JP2 files, whose colour handling needs samples.
+ *
+ * @see opj_decoder_set_extra_options() for more details.
+ */
+OPJ_BOOL opj_jp2_decoder_set_extra_options(
     opj_jp2_t *p_jp2,
     const char* const* p_options,
     opj_event_mgr_t * p_manager);

@@ -15,6 +15,7 @@
  * Copyright (c) 2012, Carl Hetherington
  * Copyright (c) 2017, IntoPIX SA <support@intopix.com>
  * Copyright (c) 2026, CtrlMovie AG
+ * Copyright (c) 2026, Mart Jansink
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -60,6 +61,8 @@
 
 #ifdef OPJ_USE_METAL
 #include "opj_metal_t1.h"
+#include "opj_metal_t1_dec.h"
+#include <pthread.h>
 #endif
 
 /** @defgroup T1 T1 - Implementation of the tier-1 coding */
@@ -1613,7 +1616,9 @@ static void opj_t1_destroy_wrapper(void* t1)
     opj_t1_destroy((opj_t1_t*) t1);
 }
 
-static void opj_t1_clbl_decode_processor(void* user_data, opj_tls_t* tls)
+/* Decodes one code-block; job stays owned by the caller */
+static void opj_t1_clbl_decode_one(opj_t1_cblk_decode_processing_job_t* job,
+                                   opj_tls_t* tls)
 {
     opj_tcd_cblk_dec_t* cblk;
     opj_tcd_band_t* band;
@@ -1623,12 +1628,9 @@ static void opj_t1_clbl_decode_processor(void* user_data, opj_tls_t* tls)
     OPJ_UINT32 cblk_w, cblk_h;
     OPJ_INT32 x, y;
     OPJ_UINT32 i, j;
-    opj_t1_cblk_decode_processing_job_t* job;
     opj_t1_t* t1;
     OPJ_UINT32 resno;
     OPJ_UINT32 tile_w;
-
-    job = (opj_t1_cblk_decode_processing_job_t*) user_data;
 
     cblk = job->cblk;
 
@@ -1648,7 +1650,6 @@ static void opj_t1_clbl_decode_processor(void* user_data, opj_tls_t* tls)
                 opj_mutex_unlock(job->p_manager_mutex);
             }
             *(job->pret) = OPJ_FALSE;
-            opj_free(job);
             return;
         }
         /* Zero-init required */
@@ -1669,7 +1670,6 @@ static void opj_t1_clbl_decode_processor(void* user_data, opj_tls_t* tls)
                           tilec->resolutions[tilec->minimum_num_resolutions - 1].x0);
 
     if (!*(job->pret)) {
-        opj_free(job);
         return;
     }
 
@@ -1680,7 +1680,6 @@ static void opj_t1_clbl_decode_processor(void* user_data, opj_tls_t* tls)
             opj_event_msg(job->p_manager, EVT_ERROR,
                           "Cannot allocate Tier 1 handle\n");
             *(job->pret) = OPJ_FALSE;
-            opj_free(job);
             return;
         }
         if (!opj_tls_set(tls, OPJ_TLS_KEY_T1, t1, opj_t1_destroy_wrapper)) {
@@ -1688,7 +1687,6 @@ static void opj_t1_clbl_decode_processor(void* user_data, opj_tls_t* tls)
                           "Unable to set t1 handle as TLS\n");
             opj_t1_destroy(t1);
             *(job->pret) = OPJ_FALSE;
-            opj_free(job);
             return;
         }
     }
@@ -1705,7 +1703,6 @@ static void opj_t1_clbl_decode_processor(void* user_data, opj_tls_t* tls)
                     job->p_manager_mutex,
                     job->check_pterm)) {
             *(job->pret) = OPJ_FALSE;
-            opj_free(job);
             return;
         }
     } else {
@@ -1719,7 +1716,6 @@ static void opj_t1_clbl_decode_processor(void* user_data, opj_tls_t* tls)
                     job->p_manager_mutex,
                     job->check_pterm)) {
             *(job->pret) = OPJ_FALSE;
-            opj_free(job);
             return;
         }
     }
@@ -1871,9 +1867,199 @@ static void opj_t1_clbl_decode_processor(void* user_data, opj_tls_t* tls)
         }
     }
 
+}
+
+static void opj_t1_clbl_decode_processor(void* user_data, opj_tls_t* tls)
+{
+    opj_t1_cblk_decode_processing_job_t* job =
+        (opj_t1_cblk_decode_processing_job_t*) user_data;
+    opj_t1_clbl_decode_one(job, tls);
     opj_free(job);
 }
 
+/* Code-blocks are handed to the thread pool in batches: one job per
+ * code-block (upstream) costs three allocations and two trips through the
+ * pool's lock, and a 4K frame has about 26000 code-blocks, many of them
+ * nearly empty. With 8 threads the workers spent more time on the lock and
+ * the allocator than decoding. A batch closes at OPJ_T1_DEC_BATCH_MAX
+ * code-blocks or OPJ_T1_DEC_BATCH_BYTES coded bytes, so that long
+ * code-blocks still spread over the threads. */
+#define OPJ_T1_DEC_BATCH_MAX 64
+#define OPJ_T1_DEC_BATCH_BYTES 2048
+
+typedef struct opj_t1_dec_batch {
+    OPJ_UINT32 n;
+    OPJ_UINT32 bytes;
+    opj_t1_cblk_decode_processing_job_t jobs[OPJ_T1_DEC_BATCH_MAX];
+} opj_t1_dec_batch_t;
+
+static void opj_t1_dec_batch_fn(void* user_data, opj_tls_t* tls)
+{
+    opj_t1_dec_batch_t* batch = (opj_t1_dec_batch_t*) user_data;
+    OPJ_UINT32 i;
+    for (i = 0; i < batch->n; i++) {
+        opj_t1_clbl_decode_one(&batch->jobs[i], tls);
+    }
+    opj_free(batch);
+}
+
+/* Submits the open batch, if any */
+static void opj_t1_dec_batch_flush(opj_thread_pool_t* tp,
+                                   opj_t1_dec_batch_t** batch)
+{
+    if (*batch) {
+        opj_thread_pool_submit_job(tp, opj_t1_dec_batch_fn, *batch);
+        *batch = NULL;
+    }
+}
+
+/* OPJ_FALSE when OPJ_T1_DEC_BATCH=0 (one job per code-block, as upstream) */
+static OPJ_BOOL opj_t1_dec_batching(opj_thread_pool_t* tp)
+{
+    static int env = -1;
+    if (env < 0) {
+        const char* e = getenv("OPJ_T1_DEC_BATCH");
+        env = (e && atoi(e) == 0) ? 0 : 1;
+    }
+    return env && opj_thread_pool_get_thread_count(tp) > 1;
+}
+
+
+/* Same selection as the code-block walk of opj_t1_decode_cblks() always   */
+/* did. A precinct outside the area of interest has the decoded data of    */
+/* its code-blocks discarded. */
+static OPJ_BOOL opj_t1_dec_precinct_wanted(opj_tcd_t* tcd,
+        opj_tcd_tilecomp_t* tilec, OPJ_UINT32 resno, opj_tcd_band_t* band,
+        opj_tcd_precinct_t* precinct)
+{
+    OPJ_UINT32 cblkno;
+    if (opj_tcd_is_subband_area_of_interest(tcd, tilec->compno, resno,
+                                            band->bandno,
+                                            (OPJ_UINT32)precinct->x0,
+                                            (OPJ_UINT32)precinct->y0,
+                                            (OPJ_UINT32)precinct->x1,
+                                            (OPJ_UINT32)precinct->y1)) {
+        return OPJ_TRUE;
+    }
+    for (cblkno = 0; cblkno < precinct->cw * precinct->ch; ++cblkno) {
+        opj_tcd_cblk_dec_t* cblk = &precinct->cblks.dec[cblkno];
+        if (cblk->decoded_data) {
+#ifdef DEBUG_VERBOSE
+            printf("Discarding codeblock %d,%d at resno=%d, bandno=%d\n",
+                   cblk->x0, cblk->y0, resno, band->bandno);
+#endif
+            opj_aligned_free(cblk->decoded_data);
+            cblk->decoded_data = NULL;
+        }
+    }
+    return OPJ_FALSE;
+}
+
+/* OPJ_TRUE if the code-block must be decoded. One outside the area of     */
+/* interest has its decoded data discarded; on partial decoding one that   */
+/* was already decoded is reused, and an empty one skipped. */
+static OPJ_BOOL opj_t1_dec_cblk_wanted(opj_tcd_t* tcd,
+                                       opj_tcd_tilecomp_t* tilec,
+                                       OPJ_UINT32 resno, opj_tcd_band_t* band,
+                                       opj_tcd_cblk_dec_t* cblk)
+{
+    if (!opj_tcd_is_subband_area_of_interest(tcd, tilec->compno, resno,
+            band->bandno,
+            (OPJ_UINT32)cblk->x0,
+            (OPJ_UINT32)cblk->y0,
+            (OPJ_UINT32)cblk->x1,
+            (OPJ_UINT32)cblk->y1)) {
+        if (cblk->decoded_data) {
+#ifdef DEBUG_VERBOSE
+            printf("Discarding codeblock %d,%d at resno=%d, bandno=%d\n",
+                   cblk->x0, cblk->y0, resno, band->bandno);
+#endif
+            opj_aligned_free(cblk->decoded_data);
+            cblk->decoded_data = NULL;
+        }
+        return OPJ_FALSE;
+    }
+    if (!tcd->whole_tile_decoding) {
+        OPJ_UINT32 cblk_w = (OPJ_UINT32)(cblk->x1 - cblk->x0);
+        OPJ_UINT32 cblk_h = (OPJ_UINT32)(cblk->y1 - cblk->y0);
+        if (cblk->decoded_data != NULL) {
+#ifdef DEBUG_VERBOSE
+            printf("Reusing codeblock %d,%d at resno=%d, bandno=%d\n",
+                   cblk->x0, cblk->y0, resno, band->bandno);
+#endif
+            return OPJ_FALSE;
+        }
+        if (cblk_w == 0 || cblk_h == 0) {
+            return OPJ_FALSE;
+        }
+#ifdef DEBUG_VERBOSE
+        printf("Decoding codeblock %d,%d at resno=%d, bandno=%d\n",
+               cblk->x0, cblk->y0, resno, band->bandno);
+#endif
+    }
+    return OPJ_TRUE;
+}
+
+/* Queues the decoding of a code-block on the thread pool. With batch != NULL
+ * it goes into *batch (opened as needed), submitted when full; the caller
+ * flushes the last one with opj_t1_dec_batch_flush() before waiting. */
+static OPJ_BOOL opj_t1_submit_decode_job(opj_tcd_t* tcd,
+        volatile OPJ_BOOL* pret, opj_tcd_tilecomp_t* tilec, opj_tccp_t* tccp,
+        OPJ_UINT32 resno, opj_tcd_band_t* band, opj_tcd_cblk_dec_t* cblk,
+        opj_event_mgr_t *p_manager, opj_mutex_t* p_manager_mutex,
+        OPJ_BOOL check_pterm, OPJ_BOOL whole_tile_decoding,
+        opj_t1_dec_batch_t** batch)
+{
+    opj_thread_pool_t* tp = tcd->thread_pool;
+    opj_t1_cblk_decode_processing_job_t* job;
+
+    if (batch) {
+        if (*batch == NULL) {
+            *batch = (opj_t1_dec_batch_t*) opj_malloc(sizeof(opj_t1_dec_batch_t));
+            if (*batch == NULL) {
+                *pret = OPJ_FALSE;
+                return OPJ_FALSE;
+            }
+            (*batch)->n = 0;
+            (*batch)->bytes = 0;
+        }
+        job = &(*batch)->jobs[(*batch)->n];
+        memset(job, 0, sizeof(*job));
+    } else {
+        job = (opj_t1_cblk_decode_processing_job_t*) opj_calloc(1,
+                sizeof(opj_t1_cblk_decode_processing_job_t));
+        if (!job) {
+            *pret = OPJ_FALSE;
+            return OPJ_FALSE;
+        }
+    }
+    /* OPJ_FALSE decodes into cblk->decoded_data, as partial decoding does */
+    job->whole_tile_decoding = whole_tile_decoding;
+    job->resno = resno;
+    job->cblk = cblk;
+    job->band = band;
+    job->tilec = tilec;
+    job->tccp = tccp;
+    job->pret = pret;
+    job->p_manager_mutex = p_manager_mutex;
+    job->p_manager = p_manager;
+    job->check_pterm = check_pterm;
+    job->mustuse_cblkdatabuffer = opj_thread_pool_get_thread_count(tp) > 1;
+    if (batch) {
+        OPJ_UINT32 c;
+        (*batch)->n++;
+        for (c = 0; c < cblk->numchunks; c++) {
+            (*batch)->bytes += cblk->chunks[c].len;
+        }
+        if ((*batch)->n == OPJ_T1_DEC_BATCH_MAX ||
+                (*batch)->bytes >= OPJ_T1_DEC_BATCH_BYTES) {
+            opj_t1_dec_batch_flush(tp, batch);
+        }
+    } else {
+        opj_thread_pool_submit_job(tp, opj_t1_clbl_decode_processor, job);
+    }
+    return *pret;
+}
 
 void opj_t1_decode_cblks(opj_tcd_t* tcd,
                          volatile OPJ_BOOL* pret,
@@ -1884,8 +2070,10 @@ void opj_t1_decode_cblks(opj_tcd_t* tcd,
                          OPJ_BOOL check_pterm
                         )
 {
-    opj_thread_pool_t* tp = tcd->thread_pool;
     OPJ_UINT32 resno, bandno, precno, cblkno;
+    opj_t1_dec_batch_t* batch = NULL;
+    opj_t1_dec_batch_t** pbatch = opj_t1_dec_batching(tcd->thread_pool) ?
+                                  &batch : NULL;
 
 #ifdef DEBUG_VERBOSE
     OPJ_UINT32 codeblocks_decoded = 0;
@@ -1901,104 +2089,842 @@ void opj_t1_decode_cblks(opj_tcd_t* tcd,
             for (precno = 0; precno < res->pw * res->ph; ++precno) {
                 opj_tcd_precinct_t* precinct = &band->precincts[precno];
 
-                if (!opj_tcd_is_subband_area_of_interest(tcd,
-                        tilec->compno,
-                        resno,
-                        band->bandno,
-                        (OPJ_UINT32)precinct->x0,
-                        (OPJ_UINT32)precinct->y0,
-                        (OPJ_UINT32)precinct->x1,
-                        (OPJ_UINT32)precinct->y1)) {
-                    for (cblkno = 0; cblkno < precinct->cw * precinct->ch; ++cblkno) {
-                        opj_tcd_cblk_dec_t* cblk = &precinct->cblks.dec[cblkno];
-                        if (cblk->decoded_data) {
-#ifdef DEBUG_VERBOSE
-                            printf("Discarding codeblock %d,%d at resno=%d, bandno=%d\n",
-                                   cblk->x0, cblk->y0, resno, bandno);
-#endif
-                            opj_aligned_free(cblk->decoded_data);
-                            cblk->decoded_data = NULL;
-                        }
-                    }
+                if (!opj_t1_dec_precinct_wanted(tcd, tilec, resno, band,
+                                                precinct)) {
                     continue;
                 }
 
                 for (cblkno = 0; cblkno < precinct->cw * precinct->ch; ++cblkno) {
                     opj_tcd_cblk_dec_t* cblk = &precinct->cblks.dec[cblkno];
-                    opj_t1_cblk_decode_processing_job_t* job;
 
-                    if (!opj_tcd_is_subband_area_of_interest(tcd,
-                            tilec->compno,
-                            resno,
-                            band->bandno,
-                            (OPJ_UINT32)cblk->x0,
-                            (OPJ_UINT32)cblk->y0,
-                            (OPJ_UINT32)cblk->x1,
-                            (OPJ_UINT32)cblk->y1)) {
-                        if (cblk->decoded_data) {
-#ifdef DEBUG_VERBOSE
-                            printf("Discarding codeblock %d,%d at resno=%d, bandno=%d\n",
-                                   cblk->x0, cblk->y0, resno, bandno);
-#endif
-                            opj_aligned_free(cblk->decoded_data);
-                            cblk->decoded_data = NULL;
-                        }
+                    if (!opj_t1_dec_cblk_wanted(tcd, tilec, resno, band, cblk)) {
                         continue;
                     }
-
-                    if (!tcd->whole_tile_decoding) {
-                        OPJ_UINT32 cblk_w = (OPJ_UINT32)(cblk->x1 - cblk->x0);
-                        OPJ_UINT32 cblk_h = (OPJ_UINT32)(cblk->y1 - cblk->y0);
-                        if (cblk->decoded_data != NULL) {
-#ifdef DEBUG_VERBOSE
-                            printf("Reusing codeblock %d,%d at resno=%d, bandno=%d\n",
-                                   cblk->x0, cblk->y0, resno, bandno);
-#endif
-                            continue;
-                        }
-                        if (cblk_w == 0 || cblk_h == 0) {
-                            continue;
-                        }
-#ifdef DEBUG_VERBOSE
-                        printf("Decoding codeblock %d,%d at resno=%d, bandno=%d\n",
-                               cblk->x0, cblk->y0, resno, bandno);
-#endif
-                    }
-
-                    job = (opj_t1_cblk_decode_processing_job_t*) opj_calloc(1,
-                            sizeof(opj_t1_cblk_decode_processing_job_t));
-                    if (!job) {
-                        *pret = OPJ_FALSE;
+                    if (!opj_t1_submit_decode_job(tcd, pret, tilec, tccp, resno,
+                                                  band, cblk, p_manager,
+                                                  p_manager_mutex, check_pterm,
+                                                  tcd->whole_tile_decoding,
+                                                  pbatch)) {
+                        opj_t1_dec_batch_flush(tcd->thread_pool, &batch);
                         return;
                     }
-                    job->whole_tile_decoding = tcd->whole_tile_decoding;
-                    job->resno = resno;
-                    job->cblk = cblk;
-                    job->band = band;
-                    job->tilec = tilec;
-                    job->tccp = tccp;
-                    job->pret = pret;
-                    job->p_manager_mutex = p_manager_mutex;
-                    job->p_manager = p_manager;
-                    job->check_pterm = check_pterm;
-                    job->mustuse_cblkdatabuffer = opj_thread_pool_get_thread_count(tp) > 1;
-                    opj_thread_pool_submit_job(tp, opj_t1_clbl_decode_processor, job);
 #ifdef DEBUG_VERBOSE
                     codeblocks_decoded ++;
 #endif
-                    if (!(*pret)) {
-                        return;
-                    }
                 } /* cblkno */
             } /* precno */
         } /* bandno */
     } /* resno */
 
+    opj_t1_dec_batch_flush(tcd->thread_pool, &batch);
 #ifdef DEBUG_VERBOSE
     printf("Leave opj_t1_decode_cblks(). Number decoded: %d\n", codeblocks_decoded);
 #endif
     return;
 }
+
+#ifdef OPJ_USE_METAL
+/* ----------------------------------------------------------------------- */
+/* GPU (Metal) T1 decoder, see metal/opj_metal_t1_dec.h.                   */
+/*                                                                         */
+/* A GPU thread decodes a code-block far more slowly than a CPU core, so   */
+/* the CPU may take the longest code-blocks (a share of the coded bytes)   */
+/* while the GPU runs the others, with the calling thread itself when      */
+/* there is no thread pool. Which share is fastest is measured, see below. */
+/* ----------------------------------------------------------------------- */
+
+typedef struct {
+    opj_tcd_cblk_dec_t* cblk;
+    opj_tcd_band_t* band;
+    opj_tcd_tilecomp_t* tilec;
+    opj_tccp_t* tccp;
+    OPJ_UINT32 resno;
+    OPJ_UINT32 gpu;   /* index in the GPU batch, or (OPJ_UINT32)-1 */
+    OPJ_BOOL priv;    /* CPU job decoding into cblk->decoded_data, to copy */
+                      /* to the tile after the GPU run (zero-copy) */
+} opj_t1_dec_ref_t;
+
+typedef struct {
+    const opj_t1_dec_ref_t* refs;
+    OPJ_INT32* const* outs;   /* NULL with zero-copy */
+    const OPJ_UINT32* status;
+    OPJ_BOOL whole_tile_decoding;
+    volatile OPJ_BOOL* pret;
+    OPJ_UINT32 begin, end;
+} opj_t1_dec_scatter_job_t;
+
+/* Position of the code-block in its tile component plane, as in */
+/* opj_t1_clbl_decode_processor() */
+static void opj_t1_dec_cblk_pos(const opj_t1_dec_ref_t* r, OPJ_UINT32* px,
+                                OPJ_UINT32* py)
+{
+    const opj_tcd_cblk_dec_t* cblk = r->cblk;
+    const opj_tcd_band_t* band = r->band;
+    const opj_tcd_tilecomp_t* tilec = r->tilec;
+    OPJ_INT32 x = cblk->x0 - band->x0;
+    OPJ_INT32 y = cblk->y0 - band->y0;
+    if (band->bandno & 1) {
+        const opj_tcd_resolution_t* pres = &tilec->resolutions[r->resno - 1];
+        x += pres->x1 - pres->x0;
+    }
+    if (band->bandno & 2) {
+        const opj_tcd_resolution_t* pres = &tilec->resolutions[r->resno - 1];
+        y += pres->y1 - pres->y0;
+    }
+    *px = (OPJ_UINT32)x;
+    *py = (OPJ_UINT32)y;
+}
+
+static OPJ_UINT32 opj_t1_dec_tile_w(const opj_tcd_tilecomp_t* tilec)
+{
+    const opj_tcd_resolution_t* res =
+        &tilec->resolutions[tilec->minimum_num_resolutions - 1];
+    return (OPJ_UINT32)(res->x1 - res->x0);
+}
+
+static void opj_t1_dec_copy_to_tile(const opj_t1_dec_ref_t* r,
+                                    const OPJ_INT32* src)
+{
+    const opj_tcd_cblk_dec_t* cblk = r->cblk;
+    const OPJ_UINT32 w = (OPJ_UINT32)(cblk->x1 - cblk->x0);
+    const OPJ_UINT32 h = (OPJ_UINT32)(cblk->y1 - cblk->y0);
+    const OPJ_UINT32 tile_w = opj_t1_dec_tile_w(r->tilec);
+    OPJ_UINT32 x, y, j;
+    OPJ_INT32* dst;
+    opj_t1_dec_cblk_pos(r, &x, &y);
+    dst = &r->tilec->data[(OPJ_SIZE_T)y * tile_w + x];
+    for (j = 0; j < h; ++j) {
+        memcpy(dst + (OPJ_SIZE_T)j * tile_w, src + (OPJ_SIZE_T)j * w,
+               (OPJ_SIZE_T)w * sizeof(OPJ_INT32));
+    }
+}
+
+/* Moves the results of code-blocks [begin, end) to where the CPU path */
+/* leaves them: the GPU output (copy path) to the tile, or to a new     */
+/* decoded_data on partial decoding; the decoded_data of private CPU    */
+/* jobs to the tile. */
+static void opj_t1_dec_scatter_job_fn(void* user_data, opj_tls_t* tls)
+{
+    const opj_t1_dec_scatter_job_t* job =
+        (const opj_t1_dec_scatter_job_t*)user_data;
+    OPJ_UINT32 i;
+    (void)tls;
+    for (i = job->begin; i < job->end; ++i) {
+        const opj_t1_dec_ref_t* r = &job->refs[i];
+        opj_tcd_cblk_dec_t* cblk = r->cblk;
+        if (r->priv) {
+            if (cblk->decoded_data) {
+                opj_t1_dec_copy_to_tile(r, cblk->decoded_data);
+                opj_aligned_free(cblk->decoded_data);
+                cblk->decoded_data = NULL;
+            }
+            continue;
+        }
+        if (r->gpu == (OPJ_UINT32) - 1 || job->status[r->gpu] != 0 ||
+                job->outs == NULL) {
+            continue;
+        }
+        if (job->whole_tile_decoding) {
+            opj_t1_dec_copy_to_tile(r, job->outs[r->gpu]);
+        } else {
+            const OPJ_SIZE_T n = (OPJ_SIZE_T)(cblk->x1 - cblk->x0) *
+                                 (OPJ_SIZE_T)(cblk->y1 - cblk->y0);
+            cblk->decoded_data = (OPJ_INT32*)opj_aligned_malloc(
+                                     n * sizeof(OPJ_INT32));
+            if (cblk->decoded_data == NULL) {
+                *(job->pret) = OPJ_FALSE;
+                continue;
+            }
+            memcpy(cblk->decoded_data, job->outs[r->gpu], n * sizeof(OPJ_INT32));
+        }
+    }
+}
+
+static int opj_t1_dec_cmp_desc(const void* a, const void* b)
+{
+    const OPJ_UINT64 x = *(const OPJ_UINT64*)a, y = *(const OPJ_UINT64*)b;
+    return (x < y) - (x > y);
+}
+
+/* The CPU/GPU split. The CPU takes the longest GPU-able code-blocks, a    */
+/* share of their coded bytes, while the GPU runs the rest. How long the   */
+/* GPU takes depends on the content far more than on that share (real      */
+/* frames keep it busy with many medium code-blocks), and with a thread    */
+/* pool the CPU alone can be faster, so the share is chosen by measurement: */
+/* a small process-wide controller keeps the T1 wall time per coded        */
+/* megabyte of each candidate (EWMA) per thread-count and tile-size class, */
+/* measures the candidates once (outward from the best so far, cutting     */
+/* short those that are far slower), then uses the fastest and now and     */
+/* then tries its neighbours, the runner-up and "CPU only" (with an        */
+/* exponential back-off for those that keep losing). The decoded samples   */
+/* are the same whatever it picks. OPJ_METAL_T1_DEC_CPU_SHARE=<percent>    */
+/* fixes the share (no adaptation); OPJ_METAL_T1_DEC_ADAPT=0 uses the      */
+/* fixed formula below.                                                    */
+#define OPJ_T1_DEC_CPU_SHARE_1 10    /* percent, one CPU thread */
+#define OPJ_T1_DEC_CPU_SHARE_STEP 5  /* percent more per extra thread */
+#define OPJ_T1_DEC_CPU_SHARE_MAX 80
+
+#define OPJ_T1_ADAPT_NCAND 9 /* the shares below, then "CPU only" */
+#define OPJ_T1_ADAPT_CPU_ONLY (OPJ_T1_ADAPT_NCAND - 1)
+#define OPJ_T1_ADAPT_PROBE_MIN 32   /* decodes between probes of a candidate */
+#define OPJ_T1_ADAPT_PROBE_MAX 512
+#define OPJ_T1_ADAPT_GAP 32         /* decodes between any two probe runs */
+#define OPJ_T1_ADAPT_ALPHA 0.3
+/* A candidate other than the best one runs for this many decodes in a row, */
+/* and after any switch of candidate the first OPJ_T1_ADAPT_WARMUP decodes  */
+/* do not count: GPU clocks follow recent load, so a decode right after     */
+/* another candidate (or after the CPU alone) measures that one's GPU state */
+/* as much as its own.                                                      */
+#define OPJ_T1_ADAPT_RUN 4
+#define OPJ_T1_ADAPT_WARMUP 2
+/* Trying a candidate that is far slower than the best one is the main cost */
+/* of adapting (at one thread, "CPU only" or a 95% share take three times  */
+/* as long as the best share). So a run ends early once a counted decode  */
+/* is OPJ_T1_ADAPT_FAR times the best candidate's cost, or one that does   */
+/* not count is OPJ_T1_ADAPT_FAR_WARM times it (more than the GPU clock    */
+/* state alone explains: about 1.4 times); and the initial sweep goes      */
+/* outward from the best candidate so far, skipping the candidates beyond  */
+/* one that lost by OPJ_T1_ADAPT_FAR. Those are still probed later when    */
+/* they become the best one's neighbours.                                  */
+#define OPJ_T1_ADAPT_FAR 1.5
+#define OPJ_T1_ADAPT_FAR_WARM 2.0
+
+static const OPJ_UINT32 opj_t1_adapt_shares[OPJ_T1_ADAPT_NCAND - 1] = {
+    0, 10, 25, 40, 60, 80, 90, 95
+};
+
+typedef struct {
+    OPJ_UINT32 decodes;
+    double ewma[OPJ_T1_ADAPT_NCAND];
+    OPJ_UINT32 n[OPJ_T1_ADAPT_NCAND];
+    OPJ_UINT32 next_probe[OPJ_T1_ADAPT_NCAND]; /* in decodes */
+    OPJ_UINT32 interval[OPJ_T1_ADAPT_NCAND];
+    OPJ_UINT32 next_run; /* no probe run before this decode */
+    int run_cand;        /* candidate of the current run */
+    int last_cand;       /* candidate of the previous decode */
+    OPJ_UINT32 streak;   /* decodes in a row with it, before this one */
+    OPJ_UINT32 run_left; /* decodes left in it */
+} opj_t1_adapt_state_t;
+
+/* [thread class: 1, 2-4, 5+][log2 of the tile's samples] */
+static opj_t1_adapt_state_t opj_t1_adapt[3][32];
+static pthread_mutex_t opj_t1_adapt_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static OPJ_UINT32 opj_t1_dec_formula_share(int nthreads)
+{
+    const OPJ_UINT32 share = OPJ_T1_DEC_CPU_SHARE_1 +
+                             (OPJ_UINT32)(nthreads > 1 ? nthreads - 1 : 0) *
+                             OPJ_T1_DEC_CPU_SHARE_STEP;
+    return opj_uint_min(share, OPJ_T1_DEC_CPU_SHARE_MAX);
+}
+
+static OPJ_UINT32 opj_t1_adapt_dist(OPJ_UINT32 a, OPJ_UINT32 b)
+{
+    return a > b ? a - b : b - a;
+}
+
+/* The fastest measured candidate other than "skip" (-1: none) */
+static int opj_t1_adapt_best_but(const opj_t1_adapt_state_t* st, int skip)
+{
+    int c, best = -1;
+    for (c = 0; c < OPJ_T1_ADAPT_NCAND; ++c) {
+        if (c != skip && st->n[c] &&
+                (best < 0 || st->ewma[c] < st->ewma[best])) {
+            best = c;
+        }
+    }
+    return best;
+}
+
+static int opj_t1_adapt_best(const opj_t1_adapt_state_t* st)
+{
+    return opj_t1_adapt_best_but(st, -1);
+}
+
+/* The unmeasured candidate nearest to best (-1: none left) that is not
+ * beyond a candidate that lost to it by OPJ_T1_ADAPT_FAR */
+static int opj_t1_adapt_next_unmeasured(const opj_t1_adapt_state_t* st,
+                                        int best)
+{
+    int d, side;
+    for (d = 1; d < OPJ_T1_ADAPT_NCAND; ++d) {
+        for (side = -1; side <= 1; side += 2) {
+            const int k = best + side * d;
+            int j;
+            OPJ_BOOL pruned = OPJ_FALSE;
+            if (k < 0 || k >= OPJ_T1_ADAPT_NCAND || st->n[k] != 0) {
+                continue;
+            }
+            for (j = best + side; j != k; j += side) {
+                if (st->n[j] &&
+                        st->ewma[j] > OPJ_T1_ADAPT_FAR * st->ewma[best]) {
+                    pruned = OPJ_TRUE;
+                    break;
+                }
+            }
+            if (!pruned) {
+                return k;
+            }
+        }
+    }
+    return -1;
+}
+
+int opj_t1_dec_split_choose(opj_tcd_t* tcd, OPJ_UINT32* key, int* cand,
+                            OPJ_BOOL* measure)
+{
+    static int env_share = -2, env_adapt = -1;
+    const int nthreads = opj_thread_pool_get_thread_count(tcd->thread_pool);
+    opj_tcd_tile_t* tile = tcd->tcd_image->tiles;
+    OPJ_UINT64 samples = 0;
+    OPJ_UINT32 compno, tclass, sclass = 0;
+    opj_t1_adapt_state_t* st;
+    int c, best, start;
+
+    if (env_share == -2) {
+        const char* env = getenv("OPJ_METAL_T1_DEC_ADAPT");
+        env_adapt = (env && strcmp(env, "0") == 0) ? 0 : 1;
+        env = getenv("OPJ_METAL_T1_DEC_CPU_SHARE");
+        env_share = env ? atoi(env) : -1;
+        if (env_share > 100) {
+            env_share = 100;
+        }
+    }
+    *cand = -1; /* nothing to report */
+    *measure = OPJ_FALSE;
+    if (env_share >= 0) {
+        return env_share;
+    }
+    if (!env_adapt) {
+        return (int)opj_t1_dec_formula_share(nthreads);
+    }
+
+    for (compno = 0; compno < tile->numcomps; ++compno) {
+        const opj_tcd_tilecomp_t* tilec = &tile->comps[compno];
+        if (tcd->used_component == NULL || tcd->used_component[compno]) {
+            samples += (OPJ_UINT64)(tilec->x1 - tilec->x0) *
+                       (OPJ_UINT64)(tilec->y1 - tilec->y0);
+        }
+    }
+    while (sclass < 31 && (samples >> (sclass + 1)) != 0) {
+        sclass++;
+    }
+    tclass = nthreads <= 1 ? 0 : nthreads <= 4 ? 1 : 2;
+    *key = tclass * 32 + sclass;
+
+    /* the formula's candidate: the nearest share */
+    {
+        const OPJ_UINT32 f = opj_t1_dec_formula_share(nthreads);
+        start = 0;
+        for (c = 1; c < OPJ_T1_ADAPT_CPU_ONLY; ++c) {
+            if (opj_t1_adapt_dist(opj_t1_adapt_shares[c], f) <
+                    opj_t1_adapt_dist(opj_t1_adapt_shares[start], f)) {
+                start = c;
+            }
+        }
+    }
+
+    pthread_mutex_lock(&opj_t1_adapt_mutex);
+    st = &opj_t1_adapt[tclass][sclass];
+    st->decodes++;
+    best = opj_t1_adapt_best(st);
+    if (st->run_left > 0) {
+        c = st->run_cand;
+        st->run_left--;
+    } else if (st->n[start] == 0) {
+        c = start;
+    } else if (st->n[OPJ_T1_ADAPT_CPU_ONLY] == 0) {
+        c = OPJ_T1_ADAPT_CPU_ONLY;
+    } else {
+        int k;
+        /* Measure the candidates once, outward from the best one: the cost */
+        /* is not monotonic in the share (the GPU clocks down while the CPU */
+        /* decodes alongside, so a small share can be slower than none and  */
+        /* than a larger one), but one that is far worse marks the end of   */
+        /* the useful range in that direction */
+        c = opj_t1_adapt_next_unmeasured(st, best);
+        if (c < 0) {
+            /* Then the best one, probing its neighbours, the runner-up */
+            /* and "CPU only" when due */
+            const int probes[4] = {
+                best - 1, best + 1, opj_t1_adapt_best_but(st, best),
+                OPJ_T1_ADAPT_CPU_ONLY
+            };
+            c = best;
+            for (k = 0; k < 4 && st->next_run <= st->decodes; ++k) {
+                const int p = probes[k];
+                if (p >= 0 && p < OPJ_T1_ADAPT_NCAND && p != best &&
+                        st->next_probe[p] <= st->decodes) {
+                    if (st->interval[p] == 0) {
+                        st->interval[p] = OPJ_T1_ADAPT_PROBE_MIN;
+                    }
+                    st->next_probe[p] = st->decodes + st->interval[p];
+                    c = p;
+                    break;
+                }
+            }
+        }
+    }
+    if (st->run_left == 0 && (c != st->run_cand || c != st->last_cand)) {
+        if (c != best) {
+            /* start a run */
+            st->run_cand = c;
+            st->run_left = OPJ_T1_ADAPT_RUN - 1;
+            st->next_run = st->decodes + OPJ_T1_ADAPT_RUN + OPJ_T1_ADAPT_GAP;
+        }
+    }
+    if (st->decodes > 1 && c == st->last_cand) {
+        st->streak++;
+    } else {
+        st->streak = 0;
+        st->last_cand = c;
+    }
+    *measure = st->streak >= OPJ_T1_ADAPT_WARMUP;
+    pthread_mutex_unlock(&opj_t1_adapt_mutex);
+
+    *cand = c;
+    return c == OPJ_T1_ADAPT_CPU_ONLY ? -1 : (int)opj_t1_adapt_shares[c];
+}
+
+void opj_t1_dec_split_report(OPJ_UINT32 key, int cand, OPJ_FLOAT64 cost,
+                             OPJ_BOOL counted)
+{
+    opj_t1_adapt_state_t* st;
+    int best_before, best_after;
+    if (cand < 0 || cand >= OPJ_T1_ADAPT_NCAND || key >= 3 * 32) {
+        return;
+    }
+    pthread_mutex_lock(&opj_t1_adapt_mutex);
+    st = &opj_t1_adapt[key / 32][key % 32];
+    best_before = opj_t1_adapt_best(st);
+    if (!counted) {
+        /* Only to cut short the run of a candidate that is far slower */
+        if (best_before >= 0 && cand != best_before &&
+                cand == st->run_cand && st->run_left > 0 &&
+                cost > OPJ_T1_ADAPT_FAR_WARM * st->ewma[best_before]) {
+            st->run_left = 0;
+            if (st->n[cand] == 0) {
+                /* an upper bound, so that the sweep moves on */
+                st->ewma[cand] = cost;
+                st->n[cand] = 1;
+            }
+            st->interval[cand] = OPJ_T1_ADAPT_PROBE_MAX;
+            st->next_probe[cand] = st->decodes + st->interval[cand];
+        }
+        pthread_mutex_unlock(&opj_t1_adapt_mutex);
+        return;
+    }
+    if (best_before >= 0 && cand != best_before && cand == st->run_cand &&
+            cost > OPJ_T1_ADAPT_FAR * st->ewma[best_before]) {
+        /* far slower: no need to finish its run */
+        st->run_left = 0;
+    }
+    if (st->n[cand] == 0) {
+        st->ewma[cand] = cost;
+    } else {
+        st->ewma[cand] = (1.0 - OPJ_T1_ADAPT_ALPHA) * st->ewma[cand] +
+                         OPJ_T1_ADAPT_ALPHA * cost;
+    }
+    st->n[cand]++;
+    best_after = opj_t1_adapt_best(st);
+    if (cand != best_before && best_before >= 0 && st->run_left == 0) {
+        if (best_after == cand) {
+            /* it won: probe again soon if it loses again */
+            st->interval[cand] = OPJ_T1_ADAPT_PROBE_MIN;
+        } else if (st->ewma[cand] > OPJ_T1_ADAPT_FAR * st->ewma[best_after]) {
+            /* it lost by far: rarely worth its cost to probe again */
+            st->interval[cand] = OPJ_T1_ADAPT_PROBE_MAX;
+            st->next_probe[cand] = st->decodes + st->interval[cand];
+        } else {
+            /* it lost: back off */
+            st->interval[cand] = opj_uint_min(
+                                     opj_uint_max(st->interval[cand], OPJ_T1_ADAPT_PROBE_MIN) * 2,
+                                     OPJ_T1_ADAPT_PROBE_MAX);
+            st->next_probe[cand] = st->decodes + st->interval[cand];
+        }
+    }
+    if (best_after != best_before && best_before >= 0) {
+        /* a new best one: look around it soon */
+        st->interval[best_before] = OPJ_T1_ADAPT_PROBE_MIN;
+        st->next_probe[best_before] = st->decodes + OPJ_T1_ADAPT_PROBE_MIN;
+    }
+    pthread_mutex_unlock(&opj_t1_adapt_mutex);
+}
+
+/* Decodes the code-blocks of all used components of the tile, those the */
+/* GPU takes on the GPU and the others with the CPU jobs. Returns         */
+/* OPJ_FALSE, with no job submitted, when the whole tile must go through  */
+/* the CPU path instead. On OPJ_TRUE all jobs have completed. */
+OPJ_BOOL opj_t1_decode_cblks_metal(opj_tcd_t* tcd,
+                                   volatile OPJ_BOOL* pret,
+                                   opj_event_mgr_t *p_manager,
+                                   opj_mutex_t* p_manager_mutex,
+                                   OPJ_BOOL check_pterm,
+                                   OPJ_UINT32 cpu_share)
+{
+    opj_thread_pool_t* tp = tcd->thread_pool;
+    opj_t1_dec_batch_t* cpu_jobs = NULL;
+    opj_t1_dec_batch_t** pcpu_jobs = opj_t1_dec_batching(tp) ? &cpu_jobs :
+                                     NULL;
+    const int nthreads = opj_thread_pool_get_thread_count(tp);
+    opj_tcd_tile_t* tile = tcd->tcd_image->tiles;
+    OPJ_UINT32 compno, resno, bandno, precno, cblkno;
+    OPJ_UINT32 ntotal = 0, ncand = 0, ngpu = 0, ncap = 0, nplanes = 0, i;
+    OPJ_INT32 plane_of_comp[OPJ_METAL_T1_DEC_MAX_PLANES];
+    OPJ_UINT32 comp_of_plane[OPJ_METAL_T1_DEC_MAX_PLANES];
+    opj_t1_dec_ref_t* refs = NULL;
+    opj_metal_t1_dec_cblk_in* cand = NULL; /* by ref index */
+    OPJ_UINT64* keys = NULL;
+    opj_metal_t1_dec_cblk_in* in = NULL;
+    OPJ_UINT32* gpu_ref = NULL;
+    OPJ_BYTE** in_ptrs = NULL;
+    OPJ_INT32** out_ptrs = NULL;
+    OPJ_UINT32* status = NULL;
+    opj_metal_t1_dec_t* batch = NULL;
+    OPJ_BOOL handled = OPJ_FALSE, committed, gpu_ok, zero_copy;
+    OPJ_FLOAT64 t0, t1, t2, t3;
+    /* Test hooks: OPJ_METAL_T1_DEC_DEBUG_CPU_EVERY=N sends every N-th     */
+    /* code-block to the CPU jobs, to exercise the mixed GPU/CPU path;      */
+    /* OPJ_METAL_T1_DEC_ZEROCOPY=0 disables decoding into the tile planes. */
+    static int debug_cpu_every = -1, zero_copy_env = -1;
+    if (debug_cpu_every < 0) {
+        const char* env = getenv("OPJ_METAL_T1_DEC_DEBUG_CPU_EVERY");
+        int v = env ? atoi(env) : 0;
+        debug_cpu_every = v < 0 ? 0 : v;
+    }
+    if (zero_copy_env < 0) {
+        const char* env = getenv("OPJ_METAL_T1_DEC_ZEROCOPY");
+        zero_copy_env = (env && strcmp(env, "0") == 0) ? 0 : 1;
+    }
+
+    t0 = opj_clock_wall();
+
+    /* A batch and a GPU slot, without waiting: when the GPU is busy (other */
+    /* decoders), the whole tile goes through the CPU path. Up to 3 batches */
+    /* may overlap on the GPU, which raised the throughput of 10 parallel   */
+    /* single-threaded decoders by 6 to 9%; decoders with a thread pool     */
+    /* allow only 1, since overlapping lowered theirs by 5 to 15%.          */
+    batch = opj_metal_t1_dec_try_acquire(nthreads <= 1 ? 3 : 1);
+    if (!batch) {
+        tcd->prof_dec_busy = opj_metal_t1_dec_available();
+        goto cleanup;
+    }
+
+    /* Enumerate the code-blocks with the selection of opj_t1_decode_cblks() */
+    for (compno = 0; compno < tile->numcomps; ++compno) {
+        opj_tcd_tilecomp_t* tilec = &tile->comps[compno];
+        opj_tccp_t* tccp = &tcd->tcp->tccps[compno];
+        if (tcd->used_component != NULL && !tcd->used_component[compno]) {
+            continue;
+        }
+        for (resno = 0; resno < tilec->minimum_num_resolutions; ++resno) {
+            opj_tcd_resolution_t* res = &tilec->resolutions[resno];
+            for (bandno = 0; bandno < res->numbands; ++bandno) {
+                opj_tcd_band_t* band = &res->bands[bandno];
+                for (precno = 0; precno < res->pw * res->ph; ++precno) {
+                    opj_tcd_precinct_t* precinct = &band->precincts[precno];
+                    if (!opj_t1_dec_precinct_wanted(tcd, tilec, resno, band,
+                                                    precinct)) {
+                        continue;
+                    }
+                    for (cblkno = 0; cblkno < precinct->cw * precinct->ch;
+                            ++cblkno) {
+                        opj_tcd_cblk_dec_t* cblk = &precinct->cblks.dec[cblkno];
+                        opj_t1_dec_ref_t* r;
+                        if (!opj_t1_dec_cblk_wanted(tcd, tilec, resno, band,
+                                                    cblk)) {
+                            continue;
+                        }
+                        if (ntotal == ncap) {
+                            opj_t1_dec_ref_t* p;
+                            ncap = ncap ? ncap * 2 : 4096;
+                            p = (opj_t1_dec_ref_t*)opj_realloc(refs,
+                                                               ncap * sizeof(*refs));
+                            if (!p) {
+                                goto cleanup;
+                            }
+                            refs = p;
+                        }
+                        r = &refs[ntotal++];
+                        r->cblk = cblk;
+                        r->band = band;
+                        r->tilec = tilec;
+                        r->tccp = tccp;
+                        r->resno = resno;
+                        r->gpu = (OPJ_UINT32) - 1;
+                        r->priv = OPJ_FALSE;
+                    }
+                }
+            }
+        }
+    }
+    if (ntotal == 0) {
+        goto cleanup;
+    }
+
+    /* The code-blocks the GPU can take */
+    cand = (opj_metal_t1_dec_cblk_in*)opj_malloc(ntotal * sizeof(*cand));
+    keys = (OPJ_UINT64*)opj_malloc(ntotal * sizeof(*keys));
+    if (!cand || !keys) {
+        goto cleanup;
+    }
+    for (i = 0; i < ntotal; ++i) {
+        const opj_t1_dec_ref_t* r = &refs[i];
+        const opj_tcd_cblk_dec_t* cblk = r->cblk;
+        const OPJ_INT32 w = cblk->x1 - cblk->x0;
+        const OPJ_INT32 h = cblk->y1 - cblk->y0;
+        OPJ_UINT32 chunk_bytes = 0, k;
+        opj_metal_t1_dec_cblk_in* c = &cand[i];
+        c->w = 0; /* not a candidate */
+        if (r->tccp->cblksty != 0 || r->tccp->roishift != 0 ||
+                cblk->numbps > OPJ_METAL_T1_DEC_MAX_NUMBPS ||
+                cblk->real_num_segs > 1 ||
+                w <= 0 || h <= 0 || w > OPJ_METAL_T1_DEC_MAX_SIDE ||
+                h > OPJ_METAL_T1_DEC_MAX_SIDE ||
+                w * h > OPJ_METAL_T1_DEC_MAX_AREA ||
+                (debug_cpu_every != 0 && (i % (OPJ_UINT32)debug_cpu_every) == 0)) {
+            continue;
+        }
+        memset(c, 0, sizeof(*c));
+        if (!cblk->corrupted && cblk->numchunks > 0 && cblk->real_num_segs > 0) {
+            for (k = 0; k < cblk->numchunks; ++k) {
+                chunk_bytes += cblk->chunks[k].len;
+            }
+            if (cblk->segs[0].len > chunk_bytes) {
+                continue; /* the CPU reads past the chunks: leave it there */
+            }
+            c->len = cblk->segs[0].len;
+            c->npasses = cblk->segs[0].real_num_passes;
+        }
+        c->w = (OPJ_UINT32)w;
+        c->h = (OPJ_UINT32)h;
+        c->orient = r->band->bandno;
+        c->qmfbid = r->tccp->qmfbid;
+        c->numbps = cblk->numbps;
+        c->half_step = 0.5f * r->band->stepsize;
+        c->plane = -1;
+        keys[ncand++] = ((OPJ_UINT64)c->len << 32) | i;
+    }
+    if (ncand == 0) {
+        goto cleanup;
+    }
+
+    /* The CPU's share: the longest of them */
+    {
+        OPJ_UINT64 total = 0, cpu = 0, target;
+        OPJ_UINT32 k = 0;
+        for (i = 0; i < ncand; ++i) {
+            total += keys[i] >> 32;
+        }
+        target = total * opj_uint_min(cpu_share, 100) / 100;
+        if (target > 0) {
+            qsort(keys, ncand, sizeof(*keys), opj_t1_dec_cmp_desc);
+            for (; k < ncand && cpu < target; ++k) {
+                cpu += keys[k] >> 32;
+                cand[keys[k] & 0xffffffffU].w = 0;
+            }
+        }
+        if (k == ncand) {
+            goto cleanup; /* nothing left for the GPU */
+        }
+    }
+
+
+    /* Zero-copy: decode straight into the tile component planes when all */
+    /* of them could be allocated mappable. */
+    for (compno = 0; compno < OPJ_METAL_T1_DEC_MAX_PLANES; ++compno) {
+        plane_of_comp[compno] = -1;
+    }
+    zero_copy = zero_copy_env && tcd->whole_tile_decoding &&
+                tile->numcomps <= OPJ_METAL_T1_DEC_MAX_PLANES;
+    for (compno = 0; zero_copy && compno < tile->numcomps; ++compno) {
+        const opj_tcd_tilecomp_t* tilec = &tile->comps[compno];
+        if (tcd->used_component != NULL && !tcd->used_component[compno]) {
+            continue;
+        }
+        if (!tilec->data_gpu_mappable || tilec->data == NULL ||
+                tilec->data_size > 0xffffffffU) {
+            zero_copy = OPJ_FALSE;
+            break;
+        }
+        plane_of_comp[compno] = (OPJ_INT32)nplanes;
+        comp_of_plane[nplanes++] = compno;
+    }
+    if (zero_copy) {
+        OPJ_INT32* planes[OPJ_METAL_T1_DEC_MAX_PLANES];
+        OPJ_SIZE_T bytes[OPJ_METAL_T1_DEC_MAX_PLANES];
+        OPJ_UINT32 n;
+        for (n = 0; n < nplanes; ++n) {
+            planes[n] = tile->comps[comp_of_plane[n]].data;
+            bytes[n] = tile->comps[comp_of_plane[n]].data_size;
+        }
+        zero_copy = opj_metal_t1_dec_set_planes(batch, planes, bytes, nplanes);
+    }
+    tcd->prof_dec_zero_copy = zero_copy;
+
+    /* Lay out the GPU batch */
+    in = (opj_metal_t1_dec_cblk_in*)opj_malloc(ncand * sizeof(*in));
+    gpu_ref = (OPJ_UINT32*)opj_malloc(ncand * sizeof(*gpu_ref));
+    if (!in || !gpu_ref) {
+        goto cleanup;
+    }
+    for (i = 0; i < ntotal; ++i) {
+        opj_t1_dec_ref_t* r = &refs[i];
+        if (cand[i].w == 0) {
+            continue;
+        }
+        in[ngpu] = cand[i];
+        if (zero_copy) {
+            OPJ_UINT32 x, y;
+            opj_t1_dec_cblk_pos(r, &x, &y);
+            in[ngpu].plane = plane_of_comp[r->tilec->compno];
+            in[ngpu].out_stride = opj_t1_dec_tile_w(r->tilec);
+            in[ngpu].out_off = y * in[ngpu].out_stride + x;
+        }
+        gpu_ref[ngpu] = i;
+        r->gpu = ngpu++;
+    }
+    in_ptrs = (OPJ_BYTE**)opj_malloc(ngpu * sizeof(*in_ptrs));
+    out_ptrs = (OPJ_INT32**)opj_malloc(ngpu * sizeof(*out_ptrs));
+    status = (OPJ_UINT32*)opj_malloc(ngpu * sizeof(*status));
+    if (!in_ptrs || !out_ptrs || !status ||
+            !opj_metal_t1_dec_prepare(batch, in, ngpu, in_ptrs, out_ptrs)) {
+        for (i = 0; i < ntotal; ++i) {
+            refs[i].gpu = (OPJ_UINT32) - 1;
+        }
+        goto cleanup;
+    }
+
+    /* Pack the coded bytes, before any CPU job writes its end-of-data */
+    /* marker into the chunks in place. */
+    for (i = 0; i < ngpu; ++i) {
+        const opj_t1_dec_ref_t* r = &refs[gpu_ref[i]];
+        const opj_tcd_cblk_dec_t* cblk = r->cblk;
+        OPJ_UINT32 left = in[i].len, k;
+        OPJ_BYTE* dst = in_ptrs[i];
+        for (k = 0; left > 0 && k < cblk->numchunks; ++k) {
+            const OPJ_UINT32 m = opj_uint_min(left, cblk->chunks[k].len);
+            memcpy(dst, cblk->chunks[k].data, m);
+            dst += m;
+            left -= m;
+        }
+        if (tcd->whole_tile_decoding && r->cblk->decoded_data) {
+            /* as opj_t1_clbl_decode_processor() */
+            opj_aligned_free(r->cblk->decoded_data);
+            r->cblk->decoded_data = NULL;
+        }
+    }
+
+    /* From here on the tile is handled here */
+    handled = OPJ_TRUE;
+    committed = opj_metal_t1_dec_commit(batch);
+    t1 = opj_clock_wall();
+    tcd->prof_dec_pack = t1 - t0;
+    tcd->prof_dec_gpu_cblks = ngpu;
+    tcd->prof_dec_cpu_cblks = ntotal - ngpu;
+
+    /* The CPU code-blocks, during the GPU run. With zero-copy they decode */
+    /* into their decoded_data, copied to the tile afterwards: the CPU      */
+    /* never writes the planes while the GPU does. */
+    for (i = 0; i < ntotal; ++i) {
+        opj_t1_dec_ref_t* r = &refs[i];
+        if (r->gpu != (OPJ_UINT32) - 1) {
+            continue;
+        }
+        r->priv = zero_copy && r->cblk->x1 > r->cblk->x0 &&
+                  r->cblk->y1 > r->cblk->y0;
+        if (!opj_t1_submit_decode_job(tcd, pret, r->tilec, r->tccp, r->resno,
+                                      r->band, r->cblk, p_manager,
+                                      p_manager_mutex, check_pterm,
+                                      r->priv ? OPJ_FALSE :
+                                      tcd->whole_tile_decoding, pcpu_jobs)) {
+            break;
+        }
+    }
+    opj_t1_dec_batch_flush(tp, &cpu_jobs);
+    t2 = opj_clock_wall();
+    tcd->prof_dec_cpu = t2 - t1;
+
+    /* wait() also when nothing was committed */
+    gpu_ok = opj_metal_t1_dec_wait(batch, status) && committed;
+    t3 = opj_clock_wall();
+    opj_metal_t1_dec_last_timing(batch, NULL, &tcd->prof_dec_gpu_exec,
+                                 &tcd->prof_dec_gpu);
+    tcd->prof_dec_gpu_wait = t3 - t2;
+    if (!gpu_ok) {
+        /* Redo every GPU code-block on the CPU; with zero-copy the CPU */
+        /* jobs overwrite what the GPU may have written. */
+        for (i = 0; i < ngpu; ++i) {
+            status[i] = 1;
+        }
+    }
+    for (i = 0; i < ngpu && *pret; ++i) {
+        opj_t1_dec_ref_t* r = &refs[gpu_ref[i]];
+        if (status[i] == 0) {
+            continue;
+        }
+        tcd->prof_dec_gpu_cblks--;
+        tcd->prof_dec_cpu_cblks++;
+        if (!opj_t1_submit_decode_job(tcd, pret, r->tilec, r->tccp, r->resno,
+                                      r->band, r->cblk, p_manager,
+                                      p_manager_mutex, check_pterm,
+                                      tcd->whole_tile_decoding, pcpu_jobs)) {
+            break;
+        }
+    }
+    opj_t1_dec_batch_flush(tp, &cpu_jobs);
+    /* the private CPU jobs must be done before their results move */
+    opj_thread_pool_wait_completion(tp, 0);
+
+    /* Move the results to the tile */
+    {
+        opj_t1_dec_scatter_job_t one;
+        one.refs = refs;
+        one.outs = zero_copy ? NULL : out_ptrs;
+        one.status = status;
+        one.whole_tile_decoding = tcd->whole_tile_decoding;
+        one.pret = pret;
+        one.begin = 0;
+        one.end = ntotal;
+        if (nthreads > 1) {
+            OPJ_UINT32 njobs = opj_uint_min((OPJ_UINT32)nthreads * 4U, ntotal);
+            const OPJ_UINT32 chunk = (ntotal + njobs - 1) / njobs;
+            opj_t1_dec_scatter_job_t* jobs = (opj_t1_dec_scatter_job_t*)
+                                             opj_malloc(njobs * sizeof(*jobs));
+            if (jobs) {
+                for (i = 0; i < njobs; ++i) {
+                    jobs[i] = one;
+                    jobs[i].begin = i * chunk;
+                    jobs[i].end = opj_uint_min((i + 1) * chunk, ntotal);
+                    opj_thread_pool_submit_job(tp, opj_t1_dec_scatter_job_fn,
+                                               &jobs[i]);
+                }
+                opj_thread_pool_wait_completion(tp, 0);
+                opj_free(jobs);
+            } else {
+                opj_t1_dec_scatter_job_fn(&one, NULL);
+            }
+        } else {
+            opj_t1_dec_scatter_job_fn(&one, NULL);
+        }
+    }
+    tcd->prof_dec_scatter = opj_clock_wall() - t3;
+
+cleanup:
+    if (batch) {
+        opj_metal_t1_dec_release(batch);
+    }
+    opj_free(refs);
+    opj_free(cand);
+    opj_free(keys);
+    opj_free(in);
+    opj_free(gpu_ref);
+    opj_free(in_ptrs);
+    opj_free(out_ptrs);
+    opj_free(status);
+    return handled;
+}
+#endif /* OPJ_USE_METAL */
 
 
 static OPJ_BOOL opj_t1_decode_cblk(opj_t1_t *t1,

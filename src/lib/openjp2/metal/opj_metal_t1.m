@@ -5,6 +5,7 @@
  * are granted under this license.
  *
  * Copyright (c) 2026, CtrlMovie AG
+ * Copyright (c) 2026, Mart Jansink
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -38,9 +39,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
-#include <mach/mach_time.h>
 
 #include "opj_metal_t1.h"
+#include "opj_metal_common.h"
 #include "opj_metal_t1_src.h" /* generated: opj_metal_t1_src[], _len */
 
 /* Layouts shared with t1_enc.metal */
@@ -143,33 +144,6 @@ struct opj_metal_t1 {
     double t_prep0, prep_s, gpu_s, total_s;
     uint32_t pool_used, fallbacks;
 };
-
-static double opj_mtl_now(void)
-{
-    static mach_timebase_info_data_t tb;
-    if (tb.denom == 0) {
-        mach_timebase_info(&tb);
-    }
-    return (double)mach_absolute_time() * tb.numer / tb.denom * 1e-9;
-}
-
-static id<MTLComputePipelineState> opj_mtl_pso(id<MTLDevice> dev,
-        id<MTLLibrary> lib, NSString* name)
-{
-    NSError* err = nil;
-    id<MTLFunction> fn = [lib newFunctionWithName:name];
-    if (!fn) {
-        fprintf(stderr, "opj_metal_t1: kernel %s not found\n", name.UTF8String);
-        return nil;
-    }
-    id<MTLComputePipelineState> pso =
-        [dev newComputePipelineStateWithFunction:fn error:&err];
-    if (!pso) {
-        fprintf(stderr, "opj_metal_t1: pipeline %s: %s\n", name.UTF8String,
-                err.localizedDescription.UTF8String);
-    }
-    return pso;
-}
 
 static void opj_mtl_init_shared(void* unused)
 {
@@ -349,25 +323,6 @@ void opj_metal_t1_last_stats(const opj_metal_t1_t* b,
     if (fallbacks) {
         *fallbacks = b->fallbacks;
     }
-}
-
-/* Grows *buf to at least size bytes (shared storage). Exact size the first
- * time, 25 % headroom when it must grow; a buffer more than 4 times too big
- * (and above 1 MB) is replaced by an exact one. */
-static BOOL opj_mtl_reserve(id<MTLDevice> dev, id<MTLBuffer> __strong* buf,
-                            size_t size)
-{
-    if (size == 0) {
-        size = 16;
-    }
-    if (*buf && (*buf).length >= size &&
-            !((*buf).length > 4 * size && (*buf).length > (1u << 20))) {
-        return YES;
-    }
-    size_t cap = (*buf && (*buf).length < size) ? size + size / 4 : size;
-    *buf = nil; /* release the old one first */
-    *buf = [dev newBufferWithLength:cap options:MTLResourceStorageModeShared];
-    return *buf != nil;
 }
 
 static uint32_t opj_mtl_out_size(uint32_t w, uint32_t h)
@@ -566,17 +521,6 @@ static void opj_mtl_encode_parallel(id<MTLComputeCommandEncoder> enc,
     [enc setBuffer:o.descBuf offset:0 atIndex:2];
     [enc dispatchThreads:MTLSizeMake(n, 1, 1)
        threadsPerThreadgroup:MTLSizeMake(OPJ_MTL_MQ_TG, 1, 1)];
-}
-
-static BOOL opj_mtl_wait(id<MTLCommandBuffer> cb)
-{
-    [cb waitUntilCompleted];
-    if (cb.status != MTLCommandBufferStatusCompleted) {
-        fprintf(stderr, "opj_metal_t1: command buffer failed: %s\n",
-                cb.error.localizedDescription.UTF8String);
-        return NO;
-    }
-    return YES;
 }
 
 OPJ_BOOL opj_metal_t1_run(opj_metal_t1_t* b, opj_metal_t1_cblk_out* out)

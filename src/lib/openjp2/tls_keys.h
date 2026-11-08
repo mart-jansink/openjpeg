@@ -5,6 +5,7 @@
  * are granted under this license.
  *
  * Copyright (c) 2016, Even Rouault
+ * Copyright (c) 2026, Mart Jansink
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -33,5 +34,7 @@
 #define OPJ_TLS_KEYS_H
 
 #define OPJ_TLS_KEY_T1  0
+/* Strip buffers of the inverse 9/7 DWT vertical pass (dwt.c) */
+#define OPJ_TLS_KEY_DWT97_V  1
 
 #endif /* OPJ_TLS_KEY_H */

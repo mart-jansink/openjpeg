@@ -13,6 +13,7 @@
  * Copyright (c) 2005, Herve Drolon, FreeImage Team
  * Copyright (c) 2012, Carl Hetherington
  * Copyright (c) 2017, IntoPIX SA <support@intopix.com>
+ * Copyright (c) 2026, Mart Jansink
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -244,6 +245,44 @@ void opj_t1_decode_cblks(opj_tcd_t* tcd,
                          opj_event_mgr_t *p_manager,
                          opj_mutex_t* p_manager_mutex,
                          OPJ_BOOL check_pterm);
+
+#ifdef OPJ_USE_METAL
+/**
+Decode the code-blocks of all used components of a tile, on the GPU where
+possible (metal/opj_metal_t1_dec.h) and with CPU jobs otherwise
+@param cpu_share percentage of the coded bytes of the GPU-able code-blocks
+that the CPU decodes meanwhile (the longest code-blocks)
+@return OPJ_FALSE, without having submitted any job, when the tile must be
+decoded with opj_t1_decode_cblks() instead; on OPJ_TRUE all jobs completed
+*/
+OPJ_BOOL opj_t1_decode_cblks_metal(opj_tcd_t* tcd,
+                                   volatile OPJ_BOOL* pret,
+                                   opj_event_mgr_t *p_manager,
+                                   opj_mutex_t* p_manager_mutex,
+                                   OPJ_BOOL check_pterm,
+                                   OPJ_UINT32 cpu_share);
+
+/**
+Chooses the CPU/GPU split of the tile's Tier-1 decoding (see t1.c)
+@param key set to the class to report the measured time under
+@param cand set to the chosen candidate, or -1 when nothing is to be reported
+@param measure set to OPJ_TRUE when the time of this decode counts (the
+first decodes after a switch of candidate do not); report it either way
+@return the CPU share in percent for opj_t1_decode_cblks_metal(), or -1 to
+decode the tile on the CPU only
+*/
+int opj_t1_dec_split_choose(opj_tcd_t* tcd, OPJ_UINT32* key, int* cand,
+                            OPJ_BOOL* measure);
+
+/**
+Reports the Tier-1 cost of a tile decoded with the candidate returned by
+opj_t1_dec_split_choose(), as wall time per coded megabyte. counted is the
+measure flag it returned: a decode that does not count only serves to cut
+short the trial of a candidate that is far slower than the best one.
+*/
+void opj_t1_dec_split_report(OPJ_UINT32 key, int cand, OPJ_FLOAT64 cost,
+                             OPJ_BOOL counted);
+#endif
 
 
 
